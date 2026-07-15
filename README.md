@@ -1,5 +1,10 @@
 # rdsframe
 
+[![PyPI version](https://img.shields.io/pypi/v/rdsframe?include_prereleases)](https://pypi.org/project/rdsframe/)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://pypi.org/project/rdsframe/)
+[![CI](https://github.com/mmanaylopez/rdsframe/actions/workflows/ci.yml/badge.svg)](https://github.com/mmanaylopez/rdsframe/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 `rdsframe` reads common R `data.frame` and `data.table` objects from binary RDS
 files directly into pandas. Numeric vectors are filled in their final NumPy
 allocation, which avoids the large intermediate Python object tree created by
