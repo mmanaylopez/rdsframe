@@ -1,0 +1,86 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rdsframe"
+version = "0.4.0a7"
+description = "Fast, memory-conscious reader for RDS data.frames"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Miguel Antonio Manay López" }]
+keywords = ["rds", "rdata", "pandas", "dataframe", "r", "parquet"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+  "Typing :: Typed",
+]
+dependencies = [
+  "numpy>=1.23",
+  "pandas>=1.5",
+]
+
+[project.optional-dependencies]
+arrow = ["pyarrow>=12"]
+parquet = ["duckdb>=1.0", "pyarrow>=12"]
+dev = [
+  "build>=1.2",
+  "mypy>=1.10",
+  "pandas-stubs>=2.2",
+  "pytest>=8",
+  "pytest-cov>=5",
+  "ruff>=0.6",
+  "twine>=5",
+]
+
+[project.urls]
+Homepage = "https://github.com/mmanaylopez/rdsframe"
+Repository = "https://github.com/mmanaylopez/rdsframe"
+Changelog = "https://github.com/mmanaylopez/rdsframe/blob/main/CHANGELOG.md"
+Issues = "https://github.com/mmanaylopez/rdsframe/issues"
+
+[project.scripts]
+rdsframe = "rdsframe.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rdsframe"]
+exclude = ["*.rar", "*.zip"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["*.rar", "*.zip"]
+include = [
+  "src/rdsframe",
+  "tests",
+  "README.md",
+  "LICENSE",
+  "CHANGELOG.md",
+  "AUDITORIA_TECNICA.md",
+  "BENCHMARKS.md",
+  "pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers -ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["rdsframe"]
+mypy_path = "src"
