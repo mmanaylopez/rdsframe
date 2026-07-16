@@ -70,7 +70,9 @@ rdsframe = ["*.c", "*.pyx"]
 
 [tool.cibuildwheel]
 build = "cp310-* cp311-* cp312-* cp313-*"
-skip = "*-musllinux_* *_i686"
+# 32-bit targets are skipped because NumPy/pandas no longer ship wheels for
+# them, so the built wheel cannot even install its dependencies for testing.
+skip = "*-musllinux_* *_i686 *-win32"
 # A wheel without the compiled scanner must never ship as a binary wheel;
 # platforms outside this matrix fall back to the sdist, where the build is
 # optional and the pure-Python path takes over.
