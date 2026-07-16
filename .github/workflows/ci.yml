@@ -45,8 +45,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-      - run: python -m pip install "numpy==1.23.5" "pandas==1.5.3"
-      - run: python -m pip install -e ".[arrow,zstd]" pytest hypothesis
+      # pyarrow is pinned to a contemporary of NumPy 1.23/pandas 1.5: a
+      # current pyarrow drags the resolver into upgrading NumPy past the
+      # pin, which breaks pandas 1.5.3's binary compatibility at import.
+      - run: python -m pip install "numpy==1.23.5" "pandas==1.5.3" "pyarrow==12.0.1"
+      - run: python -m pip install -e ".[zstd]" pytest hypothesis
+      - name: Assert the minimum versions survived dependency resolution
+        run: |
+          python - <<'EOF'
+          import numpy, pandas, pyarrow
+          assert numpy.__version__ == "1.23.5", numpy.__version__
+          assert pandas.__version__ == "1.5.3", pandas.__version__
+          assert pyarrow.__version__ == "12.0.1", pyarrow.__version__
+          EOF
       - run: pytest
         env:
           RDSFRAME_DISABLE_CYTHON: "1"
