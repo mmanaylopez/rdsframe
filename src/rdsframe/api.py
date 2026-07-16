@@ -1527,7 +1527,15 @@ def _column_to_pandas(
             # dtype (which turns None into NaN) without paying Series alignment.
             return pd.Index(value, dtype=object)
         dtype = "string[pyarrow]" if strings == "pyarrow" else "string"
-        return pd.array(value, dtype=dtype, copy=False)
+        try:
+            return pd.array(value, dtype=dtype, copy=False)
+        except (TypeError, ValueError):
+            # pandas < 2 cannot build a string array from the reader's
+            # zero-copy pyarrow large_string representation; only those
+            # versions pay this materializing fallback.
+            if hasattr(value, "to_pylist"):
+                return pd.array(value.to_pylist(), dtype=dtype)
+            raise
     if sexp_type == CPLXSXP:
         return value
     if sexp_type == RAWSXP:
