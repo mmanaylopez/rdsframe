@@ -13,6 +13,7 @@ from .api import (
     RDSCatalog,
     RFileInfo,
     RTableInfo,
+    compiled_backend_available,
     convert_rds,
     extract_rds_tables,
     inspect_r_file,
@@ -20,6 +21,7 @@ from .api import (
     materialize_uncompressed,
     read_r_object,
     read_rds,
+    read_rds_arrow,
     read_rds_dataframe,
     to_parquet,
 )
@@ -35,6 +37,7 @@ __all__ = [
     "RTableInfo",
     "ReaderLimits",
     "UnsupportedRDS",
+    "compiled_backend_available",
     "convert_rds",
     "extract_rds_tables",
     "inspect_r_file",
@@ -42,8 +45,9 @@ __all__ = [
     "materialize_uncompressed",
     "read_r_object",
     "read_rds",
+    "read_rds_arrow",
     "read_rds_dataframe",
     "to_parquet",
 ]
 
-__version__ = "0.4.0a7"
+__version__ = "0.4.0b1"

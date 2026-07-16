@@ -137,6 +137,37 @@ def compressed_rds(sample_rds: Path, tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def zstd_rds(sample_rds: Path, tmp_path: Path) -> Path:
+    """The container R >= 4.5 writes for saveRDS(..., compress = "zstd")."""
+    zstandard = pytest.importorskip("zstandard")
+    path = tmp_path / "sample.rds.zst"
+    path.write_bytes(zstandard.compress(sample_rds.read_bytes()))
+    return path
+
+
+@pytest.fixture
+def na_level_factor_rds(tmp_path: Path) -> Path:
+    """addNA(): NA is an explicit factor level, next to a genuine "" level.
+
+    Row codes: 1 -> "", 2 -> "a", 3 -> the NA level, NA_integer_ -> missing.
+    """
+    attrs = {"levels": strings(["", "a", None]), "class": strings(["factor"])}
+    payload = dataframe([integers([1, 2, 3, -(2**31)], attrs)], ["f"])
+    path = tmp_path / "na_level_factor.rds"
+    path.write_bytes(rds(payload))
+    return path
+
+
+@pytest.fixture
+def named_vector_rds(tmp_path: Path) -> Path:
+    """A named atomic vector: c(a = 1L, b = 2L, 3L) with one blank name."""
+    payload = integers([1, 2, 3], {"names": strings(["a", "b", ""])})
+    path = tmp_path / "named_vector.rds"
+    path.write_bytes(rds(payload))
+    return path
+
+
+@pytest.fixture
 def multi_frame_rds(tmp_path: Path) -> Path:
     payload = dataframe_list(
         [
@@ -215,6 +246,74 @@ def matrix_column_rds(tmp_path: Path) -> Path:
         ["id", "mat"],
     )
     path = tmp_path / "matrix_column.rds"
+    path.write_bytes(rds(payload))
+    return path
+
+
+@pytest.fixture
+def nested_dataframe_column_rds(tmp_path: Path) -> Path:
+    """A data.frame whose `sub` column is itself a 2x2 data.frame.
+
+    The square case (nested rows == nested columns) is the dangerous one:
+    every column of the outer frame has length 2, so nothing trips the
+    length check and a naive read silently returns the nested frame's
+    *columns* as if they were row values.
+    """
+    nested = dataframe([integers([3, 4]), integers([5, 6])], ["a", "b"])
+    payload = dataframe([integers([1, 2]), nested], ["id", "sub"])
+    path = tmp_path / "nested_dataframe_column.rds"
+    path.write_bytes(rds(payload))
+    return path
+
+
+@pytest.fixture
+def dataframe_of_dataframes_rds(tmp_path: Path) -> Path:
+    """A data.frame in which *every* column is a nested data.frame.
+
+    The streaming Parquet path classifies a root by its first child before
+    the root's own class attribute arrives, so this shape used to be
+    misread as a list of independent tables.
+    """
+    payload = dataframe(
+        [
+            dataframe([integers([1, 2])], ["a"]),
+            dataframe([integers([3, 4])], ["b"]),
+        ],
+        ["s1", "s2"],
+    )
+    path = tmp_path / "dataframe_of_dataframes.rds"
+    path.write_bytes(rds(payload))
+    return path
+
+
+@pytest.fixture
+def integer_posixct_rds(tmp_path: Path) -> Path:
+    """POSIXct stored with integer storage.mode (legal, e.g. DB imports)."""
+    posixct_attrs = {
+        "class": strings(["POSIXct", "POSIXt"]),
+        "tzone": strings(["UTC"]),
+    }
+    payload = dataframe(
+        [integers([1, 86400, -(2**31)], posixct_attrs)],
+        ["t"],
+    )
+    path = tmp_path / "integer_posixct.rds"
+    path.write_bytes(rds(payload))
+    return path
+
+
+@pytest.fixture
+def integer_difftime_rds(tmp_path: Path) -> Path:
+    """difftime stored with integer storage.mode."""
+    difftime_attrs = {
+        "class": strings(["difftime"]),
+        "units": strings(["days"]),
+    }
+    payload = dataframe(
+        [integers([1, 2, -(2**31)], difftime_attrs)],
+        ["elapsed"],
+    )
+    path = tmp_path / "integer_difftime.rds"
     path.write_bytes(rds(payload))
     return path
 

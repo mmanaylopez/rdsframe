@@ -9,12 +9,13 @@ identical to the object-strings path, including across chunk boundaries.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from conftest import dataframe, rds, strings
 
 import rdsframe._core as core
-from rdsframe import read_rds
+from rdsframe import list_rds_tables, read_rds
 
 
 def _text_fixture(tmp_path: Path, values: list[str | None], name: str) -> Path:
@@ -36,6 +37,16 @@ def test_arrow_matches_object_strings(tmp_path: Path) -> None:
     assert arrow_frame["label"].fillna("@NA@").tolist() == (
         object_frame["label"].fillna("@NA@").tolist()
     )
+
+
+def test_python_string_fallback_matches_optional_accelerator(tmp_path: Path) -> None:
+    """The package remains usable when a platform cannot compile Cython."""
+    values = [None if index % 11 == 0 else "same" for index in range(2_048)]
+    path = _text_fixture(tmp_path, values, "fallback")
+    accelerated = list_rds_tables(path)
+    with patch("rdsframe._core._skip_string_chunk", None):
+        fallback = list_rds_tables(path)
+    assert accelerated == fallback
 
 
 def test_arrow_chunk_boundaries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

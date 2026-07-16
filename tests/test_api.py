@@ -8,12 +8,33 @@ import pytest
 from rdsframe import (
     InvalidRDS,
     UnsupportedRDS,
+    compiled_backend_available,
     inspect_r_file,
     read_r_object,
     read_rds,
     read_rds_dataframe,
     to_parquet,
 )
+from rdsframe._core import ENVSXP, VECSXP, SerializedObject
+from rdsframe.api import _serialized_to_python
+
+
+def test_compiled_backend_probe_returns_bool() -> None:
+    assert isinstance(compiled_backend_available(), bool)
+
+
+def test_environment_cycles_and_shared_references_are_preserved() -> None:
+    contents: dict[str, object] = {}
+    environment = SerializedObject(contents, {}, ENVSXP)
+    contents["self"] = environment
+    root = SerializedObject(
+        [environment, environment],
+        {},
+        VECSXP,
+    )
+    result = _serialized_to_python(root, strings="object")
+    assert result[0] is result[1]
+    assert result[0]["self"] is result[0]
 
 
 @pytest.mark.parametrize("fixture_name", ["sample_rds", "compressed_rds"])
@@ -217,6 +238,52 @@ def test_invalid_string_backend(sample_rds: Path) -> None:
         read_rds(sample_rds, strings="invalid")  # type: ignore[arg-type]
 
 
+def test_read_zstd_rds(zstd_rds: Path) -> None:
+    frame = read_rds(zstd_rds)
+    assert isinstance(frame, pd.DataFrame)
+    assert frame.shape == (3, 5)
+    assert frame["label"].tolist() == ["á", "á", None]
+
+
+def test_inspect_zstd(zstd_rds: Path) -> None:
+    info = inspect_r_file(zstd_rds)
+    assert info.compression == "zstd"
+    assert info.container == "rds"
+    assert info.fast_supported
+
+
+def test_materialize_uncompressed_zstd(zstd_rds: Path, tmp_path: Path) -> None:
+    from rdsframe import materialize_uncompressed
+
+    target = tmp_path / "expanded.rds"
+    result = materialize_uncompressed(zstd_rds, target)
+    assert inspect_r_file(result).compression == "none"
+    assert read_rds(result).shape == (3, 5)
+
+
+def test_read_r_object_named_vector_becomes_dict(named_vector_rds: Path) -> None:
+    result = read_r_object(named_vector_rds)
+    assert result == {"a": 1, "b": 2, "_unnamed_3": 3}
+
+
+def test_read_r_object_plain_int_na_sentinel(tmp_path: Path) -> None:
+    """Fast-path NA sentinels must match the pandas round-trip (pd.NA)."""
+    from conftest import integers, rds, vectors
+
+    payload = vectors([integers([1, -(2**31)])])
+    path = tmp_path / "int_na.rds"
+    path.write_bytes(rds(payload))
+    values = read_r_object(path)
+    assert values == [[1, pd.NA]]
+
+
+def test_read_r_object_matrix_keeps_native_dtype(mixed_object_rds: Path) -> None:
+    result = read_r_object(mixed_object_rds)
+    grid = result["grid"]
+    assert grid.dtype.kind == "i"
+    assert grid.tolist() == [[1, 3], [2, 4]]
+
+
 def test_inspect_plain_and_gzip(sample_rds: Path, compressed_rds: Path) -> None:
     plain = inspect_r_file(sample_rds)
     compressed = inspect_r_file(compressed_rds)
@@ -282,3 +349,8 @@ def test_invalid_staging_configuration(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         to_parquet(sample_rds, tmp_path, **kwargs)
+
+
+def test_invalid_parquet_engine(sample_rds: Path, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="engine"):
+        to_parquet(sample_rds, tmp_path, engine="invalid")  # type: ignore[arg-type]

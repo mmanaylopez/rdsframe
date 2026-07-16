@@ -1,0 +1,12 @@
+include AUDITORIA_TECNICA.md
+include BENCHMARKS.md
+include CHANGELOG.md
+include LICENSE
+include README.md
+include pyproject.toml
+include setup.py
+recursive-include src/rdsframe *.c *.py *.pyi *.pyx py.typed
+recursive-include tests *.py *.R *.rds
+global-exclude *.py[cod] *.pyd __pycache__
+prune build
+prune dist

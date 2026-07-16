@@ -2,10 +2,31 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from rdsframe import RDSLimitError, UnsupportedRDS, read_rds, to_parquet
+from rdsframe._core import REALSXP, STRSXP, SerializedObject
+from rdsframe.api import _column_to_pandas
+
+
+def test_pandas_columns_use_array_like_fast_paths() -> None:
+    strings = _column_to_pandas(
+        SerializedObject(["a", None], {}, STRSXP), strings="object"
+    )
+    dates = _column_to_pandas(
+        SerializedObject(
+            np.array([0.0, 1.0, np.nan]),
+            {"class": SerializedObject(["Date"], {}, STRSXP)},
+            REALSXP,
+        ),
+        strings="object",
+    )
+    assert isinstance(strings, pd.Index)
+    assert not isinstance(strings, pd.Series)
+    assert isinstance(dates, np.ndarray)
+    assert dates.dtype.kind == "M"
 
 
 def test_posixlt_becomes_wall_clock_timestamps(posixlt_rds: Path) -> None:
@@ -105,6 +126,93 @@ def test_matrix_column_raises_clear_error(matrix_column_rds: Path, tmp_path: Pat
         read_rds(matrix_column_rds)
     with pytest.raises(UnsupportedRDS, match="matrix"):
         to_parquet(matrix_column_rds, tmp_path)
+
+
+def test_nested_dataframe_column_raises_clear_error(
+    nested_dataframe_column_rds: Path, tmp_path: Path
+) -> None:
+    """The square nested frame used to be read silently transposed."""
+    with pytest.raises(UnsupportedRDS, match=r"data\.frame-valued"):
+        read_rds(nested_dataframe_column_rds)
+    output = tmp_path / "nested"
+    with pytest.raises(UnsupportedRDS, match=r"data\.frame-valued"):
+        to_parquet(nested_dataframe_column_rds, output)
+    assert not list(output.glob("*.parquet"))
+
+
+def test_nested_dataframe_column_can_be_skipped_by_selection(
+    nested_dataframe_column_rds: Path,
+) -> None:
+    frame = read_rds(nested_dataframe_column_rds, columns=["id"])
+    assert frame["id"].tolist() == [1, 2]
+
+
+def test_dataframe_of_dataframes_raises_everywhere(
+    dataframe_of_dataframes_rds: Path, tmp_path: Path
+) -> None:
+    """Every column is a data.frame: the root used to be misread as a
+    list of independent tables by the streaming Parquet path."""
+    from rdsframe import list_rds_tables
+
+    with pytest.raises(UnsupportedRDS, match=r"data\.frame-valued"):
+        read_rds(dataframe_of_dataframes_rds)
+    with pytest.raises(UnsupportedRDS, match=r"data\.frame-valued"):
+        list_rds_tables(dataframe_of_dataframes_rds)
+    output = tmp_path / "df-of-dfs"
+    with pytest.raises(UnsupportedRDS, match=r"data\.frame-valued"):
+        to_parquet(dataframe_of_dataframes_rds, output)
+    assert not list(output.glob("*.parquet"))
+    assert not list(output.glob(".rdsframe-*"))
+
+
+def test_na_level_factor_maps_to_missing(na_level_factor_rds: Path) -> None:
+    """An explicit NA level must not decay to the string "" (which would be
+    indistinguishable from the genuine empty-string level alongside it)."""
+    frame = read_rds(na_level_factor_rds)
+    assert list(frame["f"].cat.categories) == ["", "a"]
+    assert frame["f"].tolist()[:2] == ["", "a"]
+    assert pd.isna(frame["f"].iloc[2])  # code pointing at the NA level
+    assert pd.isna(frame["f"].iloc[3])  # NA_integer_
+
+
+def test_na_level_factor_to_parquet(na_level_factor_rds: Path, tmp_path: Path) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    table = to_parquet(na_level_factor_rds, tmp_path)[0]
+    rows = duckdb.sql(f"SELECT f FROM read_parquet('{table.path.as_posix()}')").fetchall()
+    assert [row[0] for row in rows] == ["", "a", None, None]
+
+
+def test_integer_posixct_keeps_timestamp_semantics(integer_posixct_rds: Path) -> None:
+    frame = read_rds(integer_posixct_rds)
+    assert pd.api.types.is_datetime64_any_dtype(frame["t"])
+    first, second = frame["t"].iloc[0], frame["t"].iloc[1]
+    assert (first.year, first.month, first.day, first.second) == (1970, 1, 1, 1)
+    assert (second.year, second.month, second.day) == (1970, 1, 2)
+    assert pd.isna(frame["t"].iloc[2])
+
+
+def test_integer_posixct_to_parquet(integer_posixct_rds: Path, tmp_path: Path) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    table = to_parquet(integer_posixct_rds, tmp_path)[0]
+    rows = duckdb.sql(
+        f"SELECT epoch(t) AS s FROM read_parquet('{table.path.as_posix()}')"
+    ).fetchall()
+    assert rows[0][0] == 1.0
+    assert rows[1][0] == 86400.0
+    assert rows[2][0] is None
+
+
+def test_integer_difftime_keeps_units(integer_difftime_rds: Path, tmp_path: Path) -> None:
+    frame = read_rds(integer_difftime_rds)
+    assert pd.api.types.is_timedelta64_dtype(frame["elapsed"])
+    assert frame["elapsed"].dt.total_seconds().tolist()[:2] == [86400.0, 172800.0]
+    assert pd.isna(frame["elapsed"].iloc[2])
+    duckdb = pytest.importorskip("duckdb")
+    table = to_parquet(integer_difftime_rds, tmp_path)[0]
+    rows = duckdb.sql(
+        f"SELECT epoch(elapsed) AS s FROM read_parquet('{table.path.as_posix()}')"
+    ).fetchall()
+    assert [row[0] for row in rows] == [86400.0, 172800.0, None]
 
 
 def test_table_limit_fails_without_partial_results(

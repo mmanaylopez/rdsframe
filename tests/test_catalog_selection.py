@@ -4,10 +4,11 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-import duckdb
+import pyarrow.parquet as pq
 import pytest
 
 from rdsframe import (
+    RDSCatalog,
     RDSCatalogError,
     extract_rds_tables,
     list_rds_tables,
@@ -45,6 +46,42 @@ def test_catalog_round_trip_and_freshness(multi_frame_rds: Path, tmp_path: Path)
         catalog.load(catalog_path)
 
 
+def test_opt_in_catalog_cache_reuses_valid_sidecar(multi_frame_rds: Path) -> None:
+    sidecar = multi_frame_rds.with_suffix(".rdsframe.json")
+    first = list_rds_tables(multi_frame_rds, cache=True)
+    assert sidecar.is_file()
+
+    with patch.object(
+        Reader,
+        "flags",
+        side_effect=AssertionError("a valid catalog cache should avoid rescanning"),
+    ):
+        second = list_rds_tables(multi_frame_rds, cache=True)
+    assert second == first
+
+
+def test_invalid_opt_in_catalog_cache_is_rebuilt(multi_frame_rds: Path) -> None:
+    sidecar = multi_frame_rds.with_suffix(".rdsframe.json")
+    sidecar.write_text("partial", encoding="utf-8")
+    rebuilt = list_rds_tables(multi_frame_rds, cache=True)
+    assert rebuilt.matches(multi_frame_rds)
+    assert RDSCatalog.load(sidecar) == rebuilt
+
+
+def test_catalog_cache_accepts_an_explicit_path(
+    multi_frame_rds: Path, tmp_path: Path
+) -> None:
+    sidecar = tmp_path / "catalogs" / "multi.json"
+    catalog = list_rds_tables(multi_frame_rds, cache=sidecar)
+    assert sidecar.is_file()
+    assert RDSCatalog.load(sidecar) == catalog
+
+
+def test_catalog_cache_cannot_overwrite_source(multi_frame_rds: Path) -> None:
+    with pytest.raises(ValueError, match="must differ"):
+        list_rds_tables(multi_frame_rds, cache=multi_frame_rds)
+
+
 def test_catalog_lists_single_root_dataframe(sample_rds: Path) -> None:
     catalog = list_rds_tables(sample_rds)
     assert len(catalog.tables) == 1
@@ -56,13 +93,15 @@ def test_catalog_lists_single_root_dataframe(sample_rds: Path) -> None:
 def test_integer_selection_materializes_only_selected_frame(
     multi_frame_rds: Path, tmp_path: Path
 ) -> None:
+    pytest.importorskip("duckdb")
     with patch("rdsframe._parquet._column_to_arrow", wraps=_column_to_arrow) as convert:
-        result = extract_rds_tables(multi_frame_rds, tmp_path, [1])
+        result = extract_rds_tables(multi_frame_rds, tmp_path, [1], engine="duckdb")
     assert convert.call_count == 1
     assert [table.name for table in result] == ["labels"]
-    assert duckdb.sql(
-        f"SELECT * FROM read_parquet('{result[0].path.as_posix()}')"
-    ).fetchall() == [("a",), ("b",)]
+    assert pq.read_table(result[0].path).to_pylist() == [
+        {"label": "a"},
+        {"label": "b"},
+    ]
 
 
 def test_name_selection_reuses_catalog_without_rescanning(
@@ -80,14 +119,13 @@ def test_name_selection_reuses_catalog_without_rescanning(
             catalog=catalog,
         )
     assert [table.name for table in result] == ["numbers"]
-    assert duckdb.sql(
-        f"SELECT * FROM read_parquet('{result[0].path.as_posix()}')"
-    ).fetchall() == [(1,), (2,)]
+    assert pq.read_table(result[0].path).to_pylist() == [{"id": 1}, {"id": 2}]
 
 
 def test_validated_catalog_stops_after_last_selected_table(
     multi_frame_rds: Path, tmp_path: Path
 ) -> None:
+    pytest.importorskip("duckdb")
     catalog = list_rds_tables(multi_frame_rds)
     with patch(
         "rdsframe._parquet.scan_dataframe_from_header",
@@ -98,6 +136,7 @@ def test_validated_catalog_stops_after_last_selected_table(
             tmp_path,
             [0],
             catalog=catalog,
+            engine="duckdb",
         )
     assert [table.name for table in result] == ["numbers"]
 
@@ -107,6 +146,7 @@ def test_name_selection_can_build_catalog_automatically(
 ) -> None:
     result = to_parquet(multi_frame_rds, tmp_path, tables=["labels"])
     assert [table.name for table in result] == ["labels"]
+    assert multi_frame_rds.with_suffix(".rdsframe.json").is_file()
 
 
 def test_stale_catalog_and_invalid_selectors_are_rejected(

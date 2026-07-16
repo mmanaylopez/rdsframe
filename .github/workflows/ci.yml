@@ -17,9 +17,39 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install -e ".[dev,parquet]"
+      - run: python -m pip install -e ".[dev,duckdb,zstd]"
+      - run: python -c "import rdsframe; assert rdsframe.compiled_backend_available()"
       - run: pytest
+      - run: pytest
+        env:
+          RDSFRAME_DISABLE_CYTHON: "1"
+
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev,duckdb,zstd]"
       - run: ruff check .
+      - run: mypy src/rdsframe
+      - run: pytest --cov=rdsframe --cov-report=term-missing --cov-fail-under=80
+        env:
+          RDSFRAME_DISABLE_CYTHON: "1"
+
+  minimum-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: python -m pip install "numpy==1.23.5" "pandas==1.5.3"
+      - run: python -m pip install -e ".[arrow,zstd]" pytest hypothesis
+      - run: pytest
+        env:
+          RDSFRAME_DISABLE_CYTHON: "1"
 
   package:
     runs-on: ubuntu-latest

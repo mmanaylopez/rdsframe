@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling>=1.27"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "rdsframe"
-version = "0.4.0a7"
+version = "0.4.0b1"
 description = "Fast, memory-conscious reader for RDS data.frames"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,9 +31,13 @@ dependencies = [
 
 [project.optional-dependencies]
 arrow = ["pyarrow>=12"]
-parquet = ["duckdb>=1.0", "pyarrow>=12"]
+parquet = ["pyarrow>=12"]
+duckdb = ["duckdb>=1.0", "pyarrow>=12"]
+zstd = ["zstandard>=0.16"]
 dev = [
   "build>=1.2",
+  "cython>=3.0",
+  "hypothesis>=6.100",
   "mypy>=1.10",
   "pandas-stubs>=2.2",
   "pytest>=8",
@@ -51,26 +55,35 @@ Issues = "https://github.com/mmanaylopez/rdsframe/issues"
 [project.scripts]
 rdsframe = "rdsframe.cli:main"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/rdsframe"]
-exclude = ["*.rar", "*.zip"]
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
 
-[tool.hatch.build.targets.sdist]
-exclude = ["*.rar", "*.zip"]
-include = [
-  "src/rdsframe",
-  "tests",
-  "README.md",
-  "LICENSE",
-  "CHANGELOG.md",
-  "AUDITORIA_TECNICA.md",
-  "BENCHMARKS.md",
-  "pyproject.toml",
-]
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+rdsframe = ["py.typed", "*.pyi"]
+
+[tool.setuptools.exclude-package-data]
+rdsframe = ["*.c", "*.pyx"]
+
+[tool.cibuildwheel]
+build = "cp310-* cp311-* cp312-* cp313-*"
+skip = "*-musllinux_* *_i686"
+# A wheel without the compiled scanner must never ship as a binary wheel;
+# platforms outside this matrix fall back to the sdist, where the build is
+# optional and the pure-Python path takes over.
+test-command = 'python -c "import rdsframe; assert rdsframe.compiled_backend_available()"'
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
 
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers -ra"
+pythonpath = ["src"]
 testpaths = ["tests"]
+markers = ["fuzz: bounded property tests over malformed serialized input"]
 
 [tool.ruff]
 line-length = 100

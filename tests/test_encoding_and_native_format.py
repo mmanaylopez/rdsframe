@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from rdsframe import InvalidRDS, read_rds
-from rdsframe._core import decode_header
+from rdsframe import InvalidRDS, RDSLimitError, ReaderLimits, read_rds
+from rdsframe._core import CHARSXP, Reader, decode_header
 
 CURRENT = "<" if sys.byteorder == "little" else ">"
 OPPOSITE = ">" if CURRENT == "<" else "<"
@@ -116,3 +116,31 @@ def test_declared_header_encoding_is_used_when_recognized() -> None:
     assert resolve_native_encoding(None, None) == "utf-8"
     assert resolve_native_encoding("totally-bogus-name", None) == "utf-8"
     assert resolve_native_encoding("latin1", "utf-8") == "utf-8"  # override wins
+
+
+def test_standalone_charsxp_honors_native_encoding() -> None:
+    import conftest as helpers
+
+    data = b"caf\xe9"
+    payload = helpers.i32(CHARSXP) + helpers.i32(len(data)) + data
+    reader = Reader(
+        BytesIO(payload),
+        byteorder=">",
+        limits=ReaderLimits(),
+        native_encoding="windows-1252",
+    )
+    value = reader.read_item()
+    assert value.value == "caf\u00e9"
+
+
+def test_invalid_charsxp_length_is_malformed_not_a_limit() -> None:
+    import conftest as helpers
+
+    reader = Reader(
+        BytesIO(helpers.i32(CHARSXP) + helpers.i32(-2)),
+        byteorder=">",
+        limits=ReaderLimits(max_string_bytes=1),
+    )
+    with pytest.raises(InvalidRDS, match="invalid character length") as error:
+        reader.read_item()
+    assert not isinstance(error.value, RDSLimitError)

@@ -1,4 +1,4 @@
-"""Column-staged RDS to Parquet conversion powered by DuckDB."""
+"""Arrow conversion and column-staged Parquet export helpers."""
 
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ from ._core import (
     UnsupportedRDS,
     as_strings,
     as_value,
+    factor_codes_and_categories,
 )
 from ._scan import scan_dataframe_from_header
 
@@ -78,7 +79,7 @@ def stream_root_to_parquet(
         import duckdb
     except ImportError as exc:
         raise ImportError(
-            "Streaming Parquet export requires: pip install 'rdsframe[parquet]'"
+            "Streaming DuckDB export requires: pip install 'rdsframe[duckdb]'"
         ) from exc
 
     sexp_type, _is_object, has_attr, _has_tag, _flags = root_header
@@ -313,6 +314,14 @@ def _convert_frame_list(
 
     if selected_names is None:
         root_attributes = reader.read_attributes() if root_has_attr else {}
+        if "data.frame" in as_strings(root_attributes.get("class")):
+            # The root was classified as a list of tables from its first
+            # child, but the trailing class attribute reveals a data.frame
+            # whose columns are data.frames. Raising here still discards
+            # the staged temporaries; no final output has been renamed yet.
+            raise UnsupportedRDS(
+                "data.frame-valued data.frame columns are not supported"
+            )
         table_names = as_strings(root_attributes.get("names"))
     else:
         table_names = []
@@ -524,16 +533,30 @@ def _column_to_arrow(
         mask = value == NA_INTEGER
         levels = attributes.get("levels")
         if "factor" in classes and levels is not None:
-            codes = value.astype(np.int64) - 1
-            codes[mask] = 0
-            indices = pa.array(codes, mask=mask)
+            codes, categories = factor_codes_and_categories(value, levels)
+            missing = codes < 0
+            safe = np.where(missing, 0, codes)
+            indices = pa.array(safe, mask=missing)
             return pa.DictionaryArray.from_arrays(
-                indices, pa.array(as_strings(levels)), ordered="ordered" in classes
+                indices,
+                pa.array(categories, type=pa.string()),
+                ordered="ordered" in classes,
             )
         if "Date" in classes:
             clean = value.copy()
             clean[mask] = 0
             return pa.array(clean, mask=mask, type=pa.date32())
+        if "POSIXct" in classes or "difftime" in classes:
+            # R allows integer storage.mode for these classes; normalize to
+            # the REALSXP rules so the time semantics survive.
+            numeric = value.astype(np.float64)
+            numeric[mask] = np.nan
+            return _column_to_arrow(
+                SerializedObject(numeric, attributes, REALSXP),
+                posixct_mode=posixct_mode,
+                invalid_timestamp=invalid_timestamp,
+                list_column_mode=list_column_mode,
+            )
         return pa.array(value, mask=mask)
     if sexp_type == REALSXP:
         if "Date" in classes:
@@ -586,6 +609,13 @@ def _column_to_arrow(
             names=["real", "imag"],
         )
     if sexp_type == VECSXP:
+        if "data.frame" in classes:
+            # A nested data.frame is a VECSXP of its *columns*: the generic
+            # list-column path would write those columns as row values
+            # (silently transposed whenever the nested frame is square).
+            raise UnsupportedRDS(
+                "data.frame-valued data.frame columns are not supported"
+            )
         if "POSIXlt" in classes:
             from .api import _posixlt_to_pandas  # local import: api.py imports this module
 

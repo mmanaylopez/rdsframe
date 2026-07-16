@@ -1,5 +1,105 @@
 # Changelog
 
+## 0.4.0b1 - 2026-07-16
+
+### Upgrade notes
+
+- **`rdsframe[parquet]` no longer installs DuckDB.** It now brings only
+  PyArrow, and `to_parquet()` defaults to `engine="auto"`: DuckDB when
+  installed, PyArrow otherwise. Pipelines that rely on the memory-bounded,
+  column-staged conversion should install `rdsframe[duckdb]` and may pass
+  `engine="duckdb"` to make the requirement explicit. Outputs are equivalent;
+  the PyArrow engine materializes each table in memory before writing, while
+  the DuckDB engine keeps peak memory tied to a column batch. As a side
+  effect, the PyArrow engine preserves Arrow dictionary (factor/categorical)
+  types in the final Parquet, which the DuckDB staging step still
+  re-materializes as plain strings.
+- Exceeding a configured `ReaderLimits` bound now raises `RDSLimitError`
+  everywhere; previously some limit violations surfaced as `UnsupportedRDS`.
+  Code catching `RDSError` is unaffected.
+
+### Changes
+
+- Security/correctness: standalone `CHARSXP` values now honor their serialized
+  encoding flags; invalid negative string lengths are classified as malformed
+  data rather than configured-limit failures; environments preserve shared
+  identity and self-cycles during Python conversion. The suite now includes
+  bounded corrupt-file mutation and Hypothesis fuzz tests.
+- Added public `read_rds_arrow()`, returning a `pyarrow.Table` (or a named dict
+  of tables) without constructing pandas objects.
+- Parquet no longer requires DuckDB: `rdsframe[parquet]` installs the PyArrow
+  writer, while `rdsframe[duckdb]` enables the existing memory-bounded staged
+  engine. `to_parquet(engine="auto"|"pyarrow"|"duckdb")` and the CLI expose
+  the choice.
+- Name-based table selection now automatically writes/reuses a validated
+  catalog sidecar. CI adds strict mypy, an 80% coverage floor, NumPy 1.23.5 /
+  pandas 1.5.3 minimum-dependency tests, and corrupt/fuzz coverage.
+- Added zstd container support: R >= 4.5 writes `saveRDS(..., compress =
+  "zstd")` (R-universe already ships zstd `PACKAGES.rds`), and such files
+  previously failed with a misleading "not a supported binary RDS stream"
+  while `inspect_r_file()` reported `compression="none"`. Reading now works
+  through the standard library on Python >= 3.14 or the new
+  `rdsframe[zstd]` extra (`zstandard`); without either, the error names the
+  compression and the install command. `inspect_r_file()` reports "zstd".
+- Fixed: a factor with an explicit NA level (`addNA()`) decoded that level
+  as the string "", indistinguishable from a genuine empty-string level.
+  Codes pointing at an NA level now become missing values (pandas and
+  Arrow dictionaries cannot represent a null category), and out-of-range
+  codes in corrupted streams become missing in the Arrow path too instead
+  of producing an invalid dictionary index.
+- `read_r_object()` fidelity: a *named* atomic vector (`c(a = 1, b = 2)`)
+  now becomes a `dict` (matching named lists) instead of silently dropping
+  its names; a class-less matrix keeps its native NumPy dtype instead of
+  always decaying to `dtype=object` (`dimnames` are still not represented);
+  a `dim` attribute inconsistent with the vector length now raises
+  `InvalidRDS` instead of an unhandled reshape error.
+- Performance: converting R lists that contain many small vectors was
+  dominated by pandas Series construction (measured ~80% of wall time on a
+  real 24k-entry index file; 27.5s -> 5.0s after the change). Class-less
+  atomic vectors now convert to Python values directly, with the exact
+  same missing-value sentinels as the pandas round-trip (`pd.NA` for
+  integer/logical NA, `None`/`pd.NA` for character NA depending on the
+  strings mode). `_column_to_pandas` now returns arrays rather than
+  Series so DataFrame assembly skips per-column index alignment, and the
+  column-length consistency check runs before DataFrame construction so a
+  malformed file still raises `InvalidRDS` rather than a pandas error.
+- Performance: Date/POSIXct/difftime columns now use direct NumPy temporal
+  arrays instead of one `pd.to_datetime`/`pd.to_timedelta` setup per tiny
+  column, and object/list columns no longer require an intermediate Series.
+  On the real 27,315-table `archive.rds`, the already-optimized 0.4.0a7 worktree
+  dropped from 35.2s to 20.2s while preserving pandas dtypes and missing values.
+- Added an optional Cython prototype limited to the CHARSXP structural-skip loop. It is built
+  from generated portable C when a compiler is available and falls back to the
+  fully tested Python loop when it is not. An adaptive threshold keeps small
+  vectors on Python because extension-call setup outweighs the compiled loop
+  there. On the real 123 MiB text-heavy file,
+  catalog scanning improved from 16.7s to 3.9s (4.3x); a later isolated run
+  measured 32.6s versus 7.1s (4.56x) with identical output.
+  `compiled_backend_available()` reports which path was loaded;
+  `RDSFRAME_DISABLE_CYTHON=1` supports fallback diagnostics.
+- `list_rds_tables(..., cache=True)` now atomically writes and reuses the
+  validated `<source>.rdsframe.json` sidecar. A custom cache path is accepted;
+  corrupt or stale automatic caches are rebuilt. The CLI exposes `list --cache`.
+
+- Fixed: a data.frame column that is itself a data.frame was read (and
+  written to Parquet) **silently transposed** whenever the nested frame was
+  square -- its columns were presented as row values. The README already
+  promised a clear `UnsupportedRDS` for this shape; now `read_rds()`,
+  `read_r_object()`, `to_parquet()`, and `list_rds_tables()` all raise
+  "data.frame-valued data.frame columns are not supported". A data.frame
+  whose *every* column is a data.frame was additionally misclassified by
+  the streaming Parquet path as a list of independent tables; the root
+  class attribute (which R serializes last) is now checked before any
+  output is renamed into place, so no partial results are left behind.
+  Unselected nested-frame columns can still be skipped with
+  `read_rds(..., columns=[...])`.
+- Fixed: `POSIXct` and `difftime` columns stored with integer
+  `storage.mode` (legal in R; common in DB-imported frames) decayed to
+  plain integer columns, silently dropping the time semantics. The
+  integer payload is now normalized to the same rules as the double
+  representation in both the pandas and Arrow paths (`NA_integer_`
+  becomes `NaT`/null; the `units` and `tzone` attributes are honored).
+
 ## 0.4.0a7 - 2026-07-13
 
 - Fixed a peak-memory regression introduced in 0.4.0a6's Arrow string path

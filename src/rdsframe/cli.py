@@ -31,11 +31,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     list_parser.add_argument("input", type=Path)
     list_parser.add_argument("--json", action="store_true", dest="as_json")
-    list_parser.add_argument("--catalog", type=Path, help="save a reusable catalog")
+    catalog_group = list_parser.add_mutually_exclusive_group()
+    catalog_group.add_argument("--catalog", type=Path, help="save a reusable catalog")
+    catalog_group.add_argument(
+        "--cache",
+        action="store_true",
+        help="reuse <input>.rdsframe.json when it is fresh",
+    )
     convert_parser = subparsers.add_parser("convert", help="convert RDS data.frames to Parquet")
     convert_parser.add_argument("input", type=Path)
     convert_parser.add_argument("output", type=Path)
     convert_parser.add_argument("--basename")
+    convert_parser.add_argument(
+        "--engine", choices=["auto", "duckdb", "pyarrow"], default="auto"
+    )
     convert_parser.add_argument("--compression", default="zstd")
     convert_parser.add_argument("--memory-limit", default="1GB")
     convert_parser.add_argument("--temp-directory", type=Path)
@@ -108,7 +117,7 @@ def _run(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     if args.command == "list":
-        list_catalog = list_rds_tables(args.input)
+        list_catalog = list_rds_tables(args.input, cache=args.cache)
         if args.catalog:
             list_catalog.save(args.catalog)
         if args.as_json:
@@ -140,6 +149,7 @@ def _run(argv: list[str] | None = None) -> int:
         args.input,
         args.output,
         basename=args.basename,
+        engine=args.engine,
         compression=args.compression,
         memory_limit=args.memory_limit,
         temp_directory=args.temp_directory,

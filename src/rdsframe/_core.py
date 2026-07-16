@@ -23,6 +23,15 @@ from typing import Any, BinaryIO
 
 import numpy as np
 
+try:
+    if os.environ.get("RDSFRAME_DISABLE_CYTHON") == "1":
+        raise ImportError
+    from ._cython_core import skip_string_chunk as _skip_string_chunk
+except ImportError:  # Pure-Python wheels and systems without a compiler.
+    _skip_string_chunk = None  # type: ignore[assignment]
+
+CYTHON_ACCELERATOR_AVAILABLE = _skip_string_chunk is not None
+
 NILSXP = 0
 SYMSXP = 1
 LISTSXP = 2
@@ -101,6 +110,12 @@ _BATCH_CHUNK = 1 << 20
 # Parquet row-group granularity.
 _STRING_CHUNK = 1 << 18
 
+# Crossing the Python/C boundary and constructing a typed memoryview costs more
+# than the loop saves for the tiny vectors common in deeply nested R objects.
+# Keep those on the already-batched Python path; large analytical columns take
+# the compiled loop where the fixed entry cost is negligible.
+_CYTHON_STRING_MIN_ELEMENTS = 1024
+
 
 class RDSError(Exception):
     """Base exception for rdsframe."""
@@ -132,6 +147,7 @@ class ReaderLimits:
 
     max_vector_length: int = 2_500_000_000
     max_string_bytes: int = 256 * 1024 * 1024
+    max_allocation_bytes: int = 1 * 1024 * 1024 * 1024
     max_references: int = 10_000_000
     max_depth: int = 256
 
@@ -207,6 +223,21 @@ class Reader:
         self._pending: bytes = b""
         self._pending_pos = 0
         self._pending_len = 0
+
+    def _reference(self, index: int, *, message: str = "invalid reference index") -> Any:
+        if index < 1 or index > len(self.references):
+            raise InvalidRDS(f"{message}: {index}")
+        return self.references[index - 1]
+
+    def _check_allocation(self, count: int, itemsize: int, label: str) -> None:
+        if count < 0:
+            raise InvalidRDS(f"invalid {label} length: {count}")
+        size = count * itemsize
+        if size > self.limits.max_allocation_bytes:
+            raise RDSLimitError(
+                f"{label} allocation {size:,} bytes exceeds configured limit "
+                f"{self.limits.max_allocation_bytes:,}"
+            )
 
     def raw(self, size: int) -> bytes:
         if size < 0:
@@ -352,7 +383,7 @@ class Reader:
         elif length < 0:
             raise InvalidRDS(f"invalid vector length: {length}")
         if length > self.limits.max_vector_length:
-            raise UnsupportedRDS(
+            raise RDSLimitError(
                 f"vector length {length:,} exceeds configured limit "
                 f"{self.limits.max_vector_length:,}"
             )
@@ -371,6 +402,7 @@ class Reader:
     def numeric_array(self, dtype: np.dtype[Any]) -> np.ndarray:
         length = self.length()
         native_dtype = np.dtype(dtype).newbyteorder("=")
+        self._check_allocation(length, native_dtype.itemsize, "vector")
         array = np.empty(length, dtype=native_dtype)
         self.read_into(memoryview(array).cast("B"))
         source_is_native = (self.byteorder == "<") == (sys.byteorder == "little")
@@ -384,10 +416,7 @@ class Reader:
         sexp_type = flags & 0xFF
         if sexp_type == REFSXP:
             index = flags >> 8 or self.i32()
-            try:
-                referenced = self.references[index - 1]
-            except IndexError as exc:
-                raise InvalidRDS(f"invalid reference index: {index}") from exc
+            referenced = self._reference(index)
             if referenced is None or isinstance(referenced, str):
                 return referenced
             raise InvalidRDS(f"reference {index} does not point to a character value")
@@ -398,9 +427,18 @@ class Reader:
         length = self._unpack_i32(self.raw(4))[0]
         if length == -1:
             return None
-        if length < -1 or length > self.limits.max_string_bytes:
-            raise UnsupportedRDS(f"string length {length:,} exceeds configured limit")
+        if length < -1:
+            raise InvalidRDS(f"invalid character length: {length}")
+        if length > self.limits.max_string_bytes:
+            raise RDSLimitError(
+                f"string length {length:,} exceeds configured limit "
+                f"{self.limits.max_string_bytes:,}"
+            )
         data = self.raw(length)
+        return self._decode_charsxp(data, flags)
+
+    def _decode_charsxp(self, data: bytes, flags: int) -> str:
+        """Decode one CHARSXP payload using its gp flags and native codec."""
         gp = flags >> 12
         encoding = "latin-1" if gp & (BYTES_MASK | LATIN1_MASK) else self.native_encoding
         if gp & (UTF8_MASK | ASCII_MASK):
@@ -455,6 +493,9 @@ class Reader:
         fall back to :meth:`discard`, which turns into a real ``seek()`` on
         uncompressed sources.
         """
+        if _skip_string_chunk is not None and count >= _CYTHON_STRING_MIN_ELEMENTS:
+            self._skip_string_elements_compiled(count)
+            return
         unpack_from = self._unpack_i32_from
         max_string = self.limits.max_string_bytes
         references_len = len(self.references)
@@ -478,8 +519,9 @@ class Reader:
                         continue
                     raise InvalidRDS(f"invalid character length: {length}")
                 if length > max_string:
-                    raise UnsupportedRDS(
-                        f"string length {length:,} exceeds configured limit"
+                    raise RDSLimitError(
+                        f"string length {length:,} exceeds configured limit "
+                        f"{max_string:,}"
                     )
                 available = buf_len - pos
                 if length <= available:
@@ -504,6 +546,55 @@ class Reader:
             raise UnsupportedRDS(f"unexpected STRSXP element type: {sexp_type}")
         self._store_batch_buffer(buf, pos)
 
+    def _skip_string_elements_compiled(self, count: int) -> None:
+        """Skip STRSXP elements through the optional Cython chunk scanner."""
+        scanner = _skip_string_chunk
+        if scanner is None:  # pragma: no cover - guarded by the caller
+            raise AssertionError("compiled string scanner is unavailable")
+        remaining = count
+        references_len = len(self.references)
+        max_string = self.limits.max_string_bytes
+        little_endian = self.byteorder == "<"
+        buf, pos = self._take_batch_buffer()
+        while remaining:
+            processed, pos, status, value = scanner(
+                buf,
+                pos,
+                remaining,
+                max_string,
+                references_len,
+                little_endian,
+            )
+            remaining -= processed
+            if status == 0:
+                if remaining == 0:
+                    break
+                # The scanner stopped at an incomplete element header. Refill
+                # from that exact boundary; eight bytes cover CHARSXP and the
+                # long-form REFSXP header.
+                buf = self._refill_batch(buf, pos, 8)
+                pos = 0
+                continue
+            if status == 1:
+                # A character payload crosses the batch boundary. Bytes still
+                # in ``buf`` are already consumed; discard only the tail.
+                available = len(buf) - pos
+                buf, pos = b"", 0
+                self.discard(value - available)
+                remaining -= 1
+                continue
+            if status == 2:
+                raise InvalidRDS(f"invalid character length: {value}")
+            if status == 3:
+                raise RDSLimitError(
+                    f"string length {value:,} exceeds configured limit "
+                    f"{max_string:,}"
+                )
+            if status == 4:
+                raise InvalidRDS(f"invalid character reference index: {value}")
+            raise UnsupportedRDS(f"unexpected STRSXP element type: {value}")
+        self._store_batch_buffer(buf, pos)
+
     def read_string_elements(self, count: int, *, utf8: bool) -> list[Any]:
         """Read *count* STRSXP elements with a batched parser.
 
@@ -520,6 +611,7 @@ class Reader:
         chunk by chunk (see :meth:`arrow_string_array`), so an interning
         dict would cost a lookup per element for transient objects.
         """
+        self._check_allocation(count, 8, "string element list")
         unpack_from = self._unpack_i32_from
         max_string = self.limits.max_string_bytes
         native = self.native_encoding
@@ -549,8 +641,9 @@ class Reader:
                         continue  # NA_character_
                     raise InvalidRDS(f"invalid character length: {length}")
                 if length > max_string:
-                    raise UnsupportedRDS(
-                        f"string length {length:,} exceeds configured limit"
+                    raise RDSLimitError(
+                        f"string length {length:,} exceeds configured limit "
+                        f"{max_string:,}"
                     )
                 available = buf_len - pos
                 if length <= available:
@@ -565,6 +658,7 @@ class Reader:
                     data = head + tail
                     buf, pos, buf_len = b"", 0, 0
                 gp = flags >> 12
+                value: Any
                 if utf8:
                     if gp & flag_mask:
                         if fallback is not None:
@@ -613,10 +707,9 @@ class Reader:
                         pos, buf_len = 0, len(buf)
                     ref_index = unpack_from(buf, pos)[0]
                     pos += 4
-                try:
-                    referenced = references[ref_index - 1]
-                except IndexError as exc:
-                    raise InvalidRDS(f"invalid reference index: {ref_index}") from exc
+                if ref_index < 1 or ref_index > len(references):
+                    raise InvalidRDS(f"invalid reference index: {ref_index}")
+                referenced = references[ref_index - 1]
                 if referenced is None:
                     continue
                 if isinstance(referenced, str):
@@ -655,6 +748,8 @@ class Reader:
                 "Arrow string parsing requires: pip install 'rdsframe[arrow]'"
             ) from exc
         length = self.length()
+        self._check_allocation(length + 1, np.dtype(np.int64).itemsize, "Arrow offsets")
+        self._check_allocation((length + 7) // 8, 1, "Arrow validity bitmap")
         offsets = np.empty(length + 1, dtype=np.int64)
         offsets[0] = 0
         data = bytearray()
@@ -670,6 +765,7 @@ class Reader:
                 if piece is None:
                     null_count += 1
                 else:
+                    self._check_allocation(position + len(piece), 1, "Arrow string data")
                     data += piece
                     position += len(piece)
                     validity[index >> 3] |= 1 << (index & 7)
@@ -687,16 +783,16 @@ class Reader:
 
     def add_reference(self, value: Any) -> None:
         if len(self.references) >= self.limits.max_references:
-            raise UnsupportedRDS("reference table exceeds configured limit")
+            raise RDSLimitError("reference table exceeds configured limit")
         self.references.append(value)
 
     def read_item(self) -> Any:
         self.depth += 1
         if self.depth > self.limits.max_depth:
             self.depth -= 1
-            raise UnsupportedRDS("object nesting exceeds configured limit")
+            raise RDSLimitError("object nesting exceeds configured limit")
         try:
-            return self.read_item_from_header(self.flags())
+            return self._read_item_from_header(self.flags())
         finally:
             self.depth -= 1
 
@@ -708,15 +804,24 @@ class Reader:
         This entry point lets the Parquet pipeline inspect container boundaries
         while preserving the exact same parsing rules as :meth:`read_item`.
         """
+        self.depth += 1
+        if self.depth > self.limits.max_depth:
+            self.depth -= 1
+            raise RDSLimitError("object nesting exceeds configured limit")
+        try:
+            return self._read_item_from_header(header)
+        finally:
+            self.depth -= 1
+
+    def _read_item_from_header(
+        self, header: tuple[int, bool, bool, bool, int]
+    ) -> Any:
         sexp_type, _is_object, has_attr, has_tag, flags = header
         if sexp_type in {NILSXP, NILVALUE_SXP}:
             return None
         if sexp_type == REFSXP:
             index = flags >> 8 or self.i32()
-            try:
-                return self.references[index - 1]
-            except IndexError as exc:
-                raise InvalidRDS(f"invalid reference index: {index}") from exc
+            return self._reference(index)
         if sexp_type == SYMSXP:
             symbol = ("sym", self.read_item())
             self.add_reference(symbol)
@@ -743,7 +848,7 @@ class Reader:
         if sexp_type in {UNBOUNDVALUE_SXP, MISSINGARG_SXP}:
             return None
 
-        value = self.read_payload(sexp_type)
+        value = self.read_payload(sexp_type, flags=flags)
         attributes = self.read_attributes() if has_attr else {}
         return SerializedObject(value, attributes, sexp_type)
 
@@ -796,9 +901,28 @@ class Reader:
 
     def skip_item(self) -> SkippedObject:
         """Consume one serialized item without allocating its vector payload."""
-        return self.skip_item_from_header(self.flags())
+        self.depth += 1
+        if self.depth > self.limits.max_depth:
+            self.depth -= 1
+            raise RDSLimitError("object nesting exceeds configured limit")
+        try:
+            return self._skip_item_from_header(self.flags())
+        finally:
+            self.depth -= 1
 
     def skip_item_from_header(
+        self, header: tuple[int, bool, bool, bool, int]
+    ) -> SkippedObject:
+        self.depth += 1
+        if self.depth > self.limits.max_depth:
+            self.depth -= 1
+            raise RDSLimitError("object nesting exceeds configured limit")
+        try:
+            return self._skip_item_from_header(header)
+        finally:
+            self.depth -= 1
+
+    def _skip_item_from_header(
         self, header: tuple[int, bool, bool, bool, int]
     ) -> SkippedObject:
         sexp_type, _is_object, has_attr, has_tag, flags = header
@@ -806,8 +930,7 @@ class Reader:
             return SkippedObject(sexp_type)
         if sexp_type == REFSXP:
             index = flags >> 8 or self.i32()
-            if index < 1 or index > len(self.references):
-                raise InvalidRDS(f"invalid reference index: {index}")
+            self._reference(index)
             return SkippedObject(sexp_type)
         if sexp_type == SYMSXP:
             symbol = ("sym", self.read_item())
@@ -829,6 +952,7 @@ class Reader:
             self.discard(16 * length)
         elif sexp_type == RAWSXP:
             length = self.length()
+            self._check_allocation(length, np.dtype(np.uint8).itemsize, "raw vector")
             self.discard(length)
         elif sexp_type == STRSXP:
             length = self.length()
@@ -841,6 +965,11 @@ class Reader:
             length = self.i32()
             if length < -1:
                 raise InvalidRDS(f"invalid character length: {length}")
+            if length > self.limits.max_string_bytes:
+                raise RDSLimitError(
+                    f"string length {length:,} exceeds configured limit "
+                    f"{self.limits.max_string_bytes:,}"
+                )
             if length >= 0:
                 self.discard(length)
         elif sexp_type == ALTREP_SXP:
@@ -868,7 +997,7 @@ class Reader:
             # later REFSXP index in the stream is off by one. They are small
             # (an environment frame, S4 slots), so delegating to the reader
             # keeps the two passes provably aligned.
-            self.read_item_from_header(header)
+            self._read_item_from_header(header)
             return SkippedObject(sexp_type)
         else:
             type_name = SEXP_TYPE_NAMES.get(sexp_type)
@@ -906,7 +1035,7 @@ class Reader:
             raise InvalidRDS("attribute payload is not a pairlist")
         self.skip_pairlist(has_tag)
 
-    def read_payload(self, sexp_type: int) -> Any:
+    def read_payload(self, sexp_type: int, *, flags: int = 0) -> Any:
         if sexp_type in {INTSXP, LGLSXP}:
             return self.numeric_array(np.dtype(np.int32))
         if sexp_type == REALSXP:
@@ -914,12 +1043,24 @@ class Reader:
         if sexp_type == STRSXP:
             return self.string_array()
         if sexp_type == VECSXP:
-            return [self.read_item() for _ in range(self.length())]
+            length = self.length()
+            self._check_allocation(length, 8, "list vector")
+            return [self.read_item() for _ in range(length)]
         if sexp_type == CHARSXP:
             length = self.i32()
-            return None if length == -1 else self.raw(length).decode("utf-8", "replace")
+            if length == -1:
+                return None
+            if length < -1:
+                raise InvalidRDS(f"invalid character length: {length}")
+            if length > self.limits.max_string_bytes:
+                raise RDSLimitError(
+                    f"string length {length:,} exceeds configured limit "
+                    f"{self.limits.max_string_bytes:,}"
+                )
+            return self._decode_charsxp(self.raw(length), flags)
         if sexp_type == RAWSXP:
             length = self.length()
+            self._check_allocation(length, np.dtype(np.uint8).itemsize, "raw vector")
             array = np.empty(length, dtype=np.uint8)
             self.read_into(memoryview(array))
             return array
@@ -1001,7 +1142,8 @@ class Reader:
                 raise InvalidRDS(f"malformed {class_name} ALTREP state")
             length, start, step = int(array[0]), array[1], array[2]
             if length > self.limits.max_vector_length:
-                raise UnsupportedRDS("ALTREP sequence exceeds configured limit")
+                raise RDSLimitError("ALTREP sequence exceeds configured limit")
+            self._check_allocation(length, np.dtype(np.float64).itemsize, "ALTREP sequence")
             sequence = start + step * np.arange(length)
             if class_name == "compact_intseq":
                 return SerializedObject(sequence.astype(np.int32), attributes, INTSXP)
@@ -1103,6 +1245,45 @@ def as_strings(obj: Any) -> list[str]:
     if isinstance(value, (list, tuple, np.ndarray)):
         return ["" if item is None else str(item) for item in value]
     return []
+
+
+def as_optional_strings(obj: Any) -> list[str | None]:
+    """Like :func:`as_strings`, but keeps missing elements as ``None``."""
+    value = as_value(obj)
+    if value.__class__.__module__.startswith("pyarrow") and hasattr(value, "to_pylist"):
+        value = value.to_pylist()
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return [None if item is None else str(item) for item in value]
+    return []
+
+
+def factor_codes_and_categories(
+    values: np.ndarray, levels: Any
+) -> tuple[np.ndarray, list[str]]:
+    """Zero-based codes (-1 = missing) plus non-null categories for a factor.
+
+    R factors may carry an explicit NA level (``addNA()``); pandas and Arrow
+    dictionaries cannot hold a null category, so codes pointing at an NA
+    level become missing values here instead of decaying to the string ""
+    (which would be indistinguishable from a genuine empty-string level).
+    Out-of-range codes in a corrupted stream also become missing.
+    """
+    level_values = as_optional_strings(levels)
+    count = len(level_values)
+    codes = np.where(values == NA_INTEGER, -1, values.astype(np.int64) - 1)
+    codes[(codes < -1) | (codes >= count)] = -1
+    if any(level is None for level in level_values):
+        mapping = np.empty(count + 1, dtype=np.int64)
+        categories: list[str] = []
+        for index, level in enumerate(level_values):
+            if level is None:
+                mapping[index] = -1
+            else:
+                mapping[index] = len(categories)
+                categories.append(level)
+        mapping[count] = -1  # the slot indexed by codes == -1
+        return mapping[codes], categories
+    return codes, [level for level in level_values if level is not None]
 
 
 POSIXLT_COMPONENTS = ("sec", "min", "hour", "mday", "mon", "year")
@@ -1241,6 +1422,33 @@ def resolve_native_encoding(declared: str | None, override: str | None) -> str:
 
 _STREAM_BUFFER_SIZE = 1024 * 1024
 
+# Frame magic of the zstd format, which R >= 4.5 writes for
+# saveRDS(..., compress = "zstd").
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def _open_zstd_reader(raw: Any) -> Any:
+    """Open a decompressing reader over a zstd RDS container.
+
+    Prefers the standard library (Python >= 3.14); otherwise uses the
+    optional ``zstandard`` package. The source stream is never closed by
+    the returned reader -- the caller manages its lifetime.
+    """
+    try:
+        from compression import zstd  # type: ignore[import-not-found]
+    except ImportError:
+        pass
+    else:
+        return zstd.ZstdFile(raw)
+    try:
+        import zstandard
+    except ImportError as exc:
+        raise ImportError(
+            "this RDS is zstd-compressed (R >= 4.5, compress='zstd'); reading "
+            "it requires Python >= 3.14 or: pip install 'rdsframe[zstd]'"
+        ) from exc
+    return zstandard.ZstdDecompressor().stream_reader(raw, closefd=False)
+
 
 def is_buffer_source(source: Any) -> bool:
     """True for in-memory sources: bytes-like objects or binary file objects."""
@@ -1275,12 +1483,15 @@ def open_rds_stream(source: Any) -> Iterator[tuple[BinaryIO, BinaryIO, str]]:
     try:
         magic = raw.read(6)
         raw.seek(0)
+        decompressor: Any | None
         if magic.startswith(b"\x1f\x8b"):
             decompressor, compression = gzip.GzipFile(fileobj=raw), "gzip"
         elif magic.startswith(b"BZh"):
             decompressor, compression = bz2.BZ2File(raw), "bzip2"
         elif magic.startswith(b"\xfd7zXZ\x00"):
             decompressor, compression = lzma.LZMAFile(raw), "xz"  # noqa: SIM115
+        elif magic.startswith(ZSTD_MAGIC):
+            decompressor, compression = _open_zstd_reader(raw), "zstd"
         else:
             decompressor, compression = None, "none"
         if decompressor is not None:

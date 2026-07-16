@@ -10,13 +10,15 @@ files directly into pandas. Numeric vectors are filled in their final NumPy
 allocation, which avoids the large intermediate Python object tree created by
 general-purpose R serialization readers.
 
-> Status: 0.4.0a7 pre-release. Validate results against R for critical pipelines.
+> Status: 0.4.0b1 pre-release. Validate results against R for critical pipelines.
 > Unsupported R structures fail explicitly; they are never silently coerced.
 
 ## Features
 
 - R serialization versions 2 and 3, XDR and native binary formats.
-- Uncompressed, gzip, bzip2, and xz containers.
+- Uncompressed, gzip, bzip2, xz, and zstd containers (zstd is what
+  R >= 4.5 writes for `compress = "zstd"`; reading it needs Python >= 3.14
+  or the `rdsframe[zstd]` extra).
 - Integer, double, logical, character, factor (ordered and unordered), `Date`,
   `POSIXct`, `POSIXlt`, `difftime`, raw, and the ALTREP representations R
   actually serializes (compact integer/real sequences, deferred `as.character`
@@ -25,6 +27,9 @@ general-purpose R serialization readers.
 - Batched string parsing: STRSXP columns are decoded (or structurally
   skipped) from large chunks instead of three stream reads per element,
   which is what makes text-heavy catalogs practical (see `BENCHMARKS.md`).
+- Optional compiled scanner: Cython accelerates only structural CHARSXP
+  skipping when the extension is available; materializing strings remains on
+  the tested Python path, as does all parsing without the module.
 - Explicit policies for time zones, invalid timestamps, and heterogeneous
   list-columns; lossy conversion is never activated implicitly.
 - A single `data.frame` or a named list of `data.frame` objects -- and, via
@@ -35,7 +40,8 @@ general-purpose R serialization readers.
 - Character row names become the pandas index; R's compact default row
   numbering stays a `RangeIndex`.
 - Nullable pandas integer/boolean dtypes and categorical factors.
-- Column-staged Parquet export through DuckDB and a command-line interface.
+- Public Arrow-table reads plus Parquet export through PyArrow or the optional
+  memory-bounded DuckDB engine, and a command-line interface.
 - Configurable defensive limits for untrusted or unexpectedly large inputs.
 - Low-allocation table catalogs and selective extraction by index, name, or
   (for `read_rds()`) column, plus `materialize_uncompressed()` for repeated
@@ -48,6 +54,30 @@ third-party ALTREP classes are intentionally unsupported -- and fail with an
 error that names the R type, so applications can tell users exactly why a
 slower general-purpose fallback is being used.
 
+## How it compares
+
+One fresh process per read on the same machine (Windows 11, Python 3.12,
+2026-07-16), wall time / peak RSS, against `pyreadr 0.5.6` (librdata, C) and
+`rdata 1.1.0`. Synthetic inputs are uncompressed; details, versions, and
+caveats in `BENCHMARKS.md` -- treat these as one data point, not a universal
+claim.
+
+| Input | rdsframe | pyreadr | rdata |
+| --- | ---: | ---: | ---: |
+| 2M rows x 8 numeric columns (88 MiB) | **0.7 s / 199 MB** | 1.8 s / 469 MB | 1.3 s / 490 MB |
+| 1M rows x 5 text-heavy columns | **2.6 s / 228 MB** | 16.9 s / 418 MB | 39.3 s / 1.7 GB |
+| nflverse play-by-play 2023 (49,665 x 372, gzip) | **4.3 s / 322 MB** | 4.7 s / 766 MB | 94 s / 3.7 GB |
+| 123 MiB gzip, root = named list of 6 data.frames | **32 s (all tables)** | returns `{}` silently | impractical |
+| Catalog only (`list_rds_tables`) of that same file | **3.9 s** | n/a | n/a |
+
+Two structural differences matter more than the timings. pyreadr (librdata)
+cannot read an RDS whose root is a *list* of data.frames -- it returns an
+empty dict without raising -- while that layout is exactly what `rdsframe`
+targets, including selective extraction. And where all three readers can read
+the same file, `rdsframe`'s output was verified value-for-value against
+pyreadr (372/372 columns identical on the nflverse file) and against R itself
+via checksums.
+
 ## Install
 
 ```bash
@@ -59,6 +89,24 @@ For Parquet export:
 ```bash
 pip install "rdsframe[parquet]"
 ```
+
+This installs PyArrow and does not require DuckDB. Install the streaming,
+column-staged engine when conversion must keep peak memory tied to a column
+batch rather than a complete table:
+
+```bash
+pip install "rdsframe[duckdb]"
+```
+
+For zstd-compressed RDS on Python < 3.14:
+
+```bash
+pip install "rdsframe[zstd]"
+```
+
+Source builds try to compile the small Cython-generated scanner from portable
+C, but compilation failure is optional and never prevents installation. Check
+the active installation with `rdsframe.compiled_backend_available()`.
 
 ## Python API
 
@@ -78,6 +126,16 @@ in Arrow-backed pandas arrays:
 ```python
 data = read_rds("measurements.rds", strings="pyarrow")
 ```
+
+To bypass pandas entirely, request public Arrow tables:
+
+```python
+from rdsframe import read_rds_arrow
+
+table = read_rds_arrow("measurements.rds")
+```
+
+A named list returns `dict[str, pyarrow.Table]`.
 
 To read only a few fields from a wide single data.frame, select columns by
 zero-based index or exact name. Unselected columns are structurally skipped:
@@ -118,7 +176,10 @@ A named R list becomes a `dict`; an unnamed list becomes a `list`; a nested
 `data.frame` anywhere inside either still becomes a pandas `DataFrame`.
 Atomic vectors get the same type rules as a data.frame column (factor,
 `Date`, `POSIXct`, `difftime`, matrices via a `dim` attribute) but come back
-as a plain Python scalar or list rather than a pandas Series. This is a
+as a plain Python scalar or list rather than a pandas Series. A *named*
+atomic vector (`c(a = 1, b = 2)`) becomes a `dict` like a named list does,
+and a class-less matrix keeps its native NumPy dtype (`dimnames` are not
+represented). This is a
 general, exploratory reader, not the fast path: it materializes the whole
 structure in memory rather than streaming it, so prefer `read_rds()` /
 `to_parquet()` whenever the file actually is tabular.
@@ -131,6 +192,10 @@ data = read_rds("input.rds", limits=limits, strings="string")
 
 tables = to_parquet("input.rds", "output", compression="zstd")
 ```
+
+`engine="auto"` selects DuckDB when installed and otherwise writes with
+PyArrow. Use `engine="pyarrow"` to require the dependency-light route or
+`engine="duckdb"` to require column-staged, spill-to-disk conversion.
 
 Safety and fidelity policies are explicit:
 
@@ -168,8 +233,10 @@ tables = to_parquet(
 
 ```bash
 rdsframe inspect input.rds
+rdsframe list input.rds --cache
 rdsframe list input.rds --catalog input.rdsframe.json
 rdsframe convert input.rds output/ \
+  --engine pyarrow \
   --table-name measurements \
   --catalog input.rdsframe.json \
   --max-tables 100 \
@@ -205,12 +272,14 @@ Discover tables without building their pandas, NumPy, Arrow, or Parquet payloads
 ```python
 from rdsframe import list_rds_tables
 
-catalog = list_rds_tables("workspace.rds")
+catalog = list_rds_tables("workspace.rds", cache=True)
 for table in catalog.tables:
     print(table.index, table.name, table.rows, table.columns)
-
-catalog.save("workspace.rdsframe.json")
 ```
+
+With `cache=True`, the first scan writes `workspace.rdsframe.json`; later calls
+return it immediately while source path, size, and modification time match.
+Pass an explicit path as `cache="catalogs/workspace.json"` when desired.
 
 Extract by zero-based index in one pass:
 
@@ -235,7 +304,10 @@ extract_rds_tables(
 ```
 
 The catalog stores the absolute path, file size and nanosecond modification
-time. A stale or foreign catalog raises `RDSCatalogError` before conversion.
+time. An explicitly loaded stale or foreign catalog raises `RDSCatalogError`
+before conversion; the opt-in automatic cache rebuilds stale sidecars.
+Name-based `to_parquet()` / `extract_rds_tables()` selection automatically
+creates and reuses this sidecar when no explicit catalog is supplied.
 
 RDS is sequential and normally stores list names after all elements. Therefore:
 
@@ -247,8 +319,8 @@ RDS is sequential and normally stores list names after all elements. Therefore:
   the remaining stream to recover original names;
 - a validated catalog enables early stop after the last selected table and is
   the fastest repeated workflow;
-- name selection without a catalog performs one structural listing pass and a
-  second selective conversion pass.
+- the first name selection without an explicit catalog performs a structural
+  listing pass and saves it; subsequent selections reuse the validated cache.
 
 The source distribution includes `BENCHMARKS.md` with preliminary reproducible
 results and their limitations.
@@ -258,13 +330,14 @@ results and their limitations.
 `read_rds()` returns pandas objects and therefore requires the resulting table to
 fit in memory. Numeric columns avoid a full-size temporary bytes buffer.
 
-`to_parquet()` is the large-file path: it constructs Arrow-native columns and
-stages memory-bounded groups of columns before DuckDB combines them with a
-positional join. Character vectors are built from offsets, UTF-8 data and
+`to_parquet(engine="duckdb")` is the lowest-memory path: it constructs
+Arrow-native columns and stages bounded groups before DuckDB combines them with
+a positional join. Character vectors are built from offsets, UTF-8 data and
 validity buffers without retaining a Python `str` object for every row. Peak
 parser memory is tied to the current column plus the configured staging batch,
 not to the entire data frame. DuckDB can spill merge work to disk, controlled by
-`memory_limit` and `temp_directory`.
+`memory_limit` and `temp_directory`. The PyArrow engine and `read_rds_arrow()`
+materialize a complete table, trading higher peak memory for fewer dependencies.
 
 For the lowest possible peak, set `stage_max_columns=1`. For faster conversion
 of wide, narrow-column tables, increase the batch limits after benchmarking.
@@ -281,15 +354,35 @@ GROUP BY category;
 ## Development
 
 ```bash
-python -m pip install -e ".[dev,parquet]"
+python -m pip install -e ".[dev,duckdb,zstd]"
 pytest
 ruff check .
+mypy src/rdsframe
+pytest --cov=rdsframe --cov-fail-under=80
 python -m build
 twine check dist/*
 ```
 
 Before a public release, run the test matrix and publish to TestPyPI first.
 The project lives at <https://github.com/mmanaylopez/rdsframe>.
+
+### Releasing
+
+1. Bump the version in `pyproject.toml` and `src/rdsframe/__init__.py`, and
+   date the `CHANGELOG.md` section.
+2. Commit, push, and wait for the full CI matrix to pass (it validates the
+   Cython build on the three platforms, the pure-Python fallback, and the
+   minimum supported NumPy/pandas versions -- environments a single dev
+   machine cannot cover).
+3. Tag `vX.Y.Z` and push the tag: `release.yml` builds the sdist plus binary
+   wheels via cibuildwheel and publishes through PyPI Trusted Publishing
+   (one-time setup: PyPI project settings -> Publishing -> GitHub publisher
+   for this repo, workflow `release.yml`, environment `pypi`).
+4. Manual fallback: upload **only the sdist** (`python -m build --sdist`,
+   then `twine upload dist/*.tar.gz`). Never upload a locally built wheel:
+   without a working compiler, setuptools still tags it platform-specific
+   even though the accelerator is missing, and that wheel would shadow the
+   sdist for every user of that platform.
 
 ## RData and fallback integration
 
@@ -311,6 +404,9 @@ RData, unsupported ALTREP classes, and richer R objects. An
   default. `list_column_mode="json"` produces deterministic UTF-8 JSON, including
   tagged encodings for binary and non-finite values; `"string"` is available
   only when human-readable representation is preferred over structure.
+- A factor with an explicit NA level (`addNA()`) maps values at that level
+  to missing: pandas/Arrow dictionaries cannot hold a null category, and
+  mapping it to `""` would collide with a genuine empty-string level.
 - Ordered factors (`factor(x, ordered = TRUE)`) become an ordered
   `pandas.Categorical`; plain factors are unordered. `to_parquet()` marks the
   underlying Arrow dictionary as ordered too, though the DuckDB staging step

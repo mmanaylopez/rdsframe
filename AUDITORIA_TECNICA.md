@@ -451,3 +451,34 @@ comentado como límite defensivo (R escribe exactamente dos entradas:
 nombre y versión). CLOSXP/LANGSXP/fórmulas siguen fuera de alcance por
 diseño: reconstruir sintaxis R desde el AST serializado es arriesgado y
 el fallo limpio con nombre de tipo ya permite al llamador decidir.
+
+## Cierre de P0/P1 y apertura de la siguiente capa (2026-07-16)
+
+La revisión de seguridad quedó cerrada con validación estricta de `REFSXP`
+(incluido el índice cero), profundidad máxima simétrica en lectura y
+`skip_item()`, preservación de ciclos/identidad compartida en environments,
+decodificación de `CHARSXP` según flags y encoding nativo, y límites separados
+para longitud lógica y bytes de asignación. Un archivo malformado produce
+`InvalidRDS`; exceder una política configurada produce `RDSLimitError`, no
+`UnsupportedRDS`. Pruebas de truncamiento, mutación de bits y fuzz acotado fijan
+este contrato.
+
+En pandas, las columnas simples llegan como arrays/ExtensionArrays y el
+`DataFrame` se construye una sola vez, sin alineación previa de `Series`.
+`Date`, `POSIXct` y `difftime` pequeños usan conversión NumPy directa. En el
+archivo real `archive.rds` (27 315 tablas), el tiempo observado bajó de 35.160 s
+a 20.248 s.
+
+El prototipo Cython se mantuvo deliberadamente limitado a
+`skip_string_elements`: no decodifica strings, no posee el stream y no altera
+el estado del parser. En `datos_limpios.rds`, el benchmark aislado más reciente
+midió 32.559 s en Python y 7.147 s con Cython (**4.56x**), verificando catálogos
+idénticos. `benchmarks/benchmark_cython_skip.py` reproduce la comparación en
+procesos separados.
+
+La capa posterior ya está abierta: `read_rds_arrow()` es pública;
+`to_parquet(engine="pyarrow")` funciona sin DuckDB, mientras
+`engine="duckdb"` conserva la ruta column-staged de menor memoria; y la
+selección de tablas por nombre crea/reutiliza automáticamente el catálogo. La
+CI ejecuta mypy estricto, cobertura mínima del 80%, el fallback sin Cython,
+NumPy 1.23.5/pandas 1.5.3 y los casos corruptos/fuzz.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import pandas as pd
 
 from ._core import (
     CPLXSXP,
+    CYTHON_ACCELERATOR_AVAILABLE,
     DIFFTIME_SECONDS_PER_UNIT,
     ENVSXP,
     INTSXP,
@@ -28,9 +30,11 @@ from ._core import (
     S4SXP,
     STRSXP,
     VECSXP,
+    ZSTD_MAGIC,
     InvalidRDS,
     ProgressCallback,
     RDSCatalogError,
+    RDSLimitError,
     Reader,
     ReaderLimits,
     SerializedObject,
@@ -39,6 +43,7 @@ from ._core import (
     as_strings,
     as_value,
     decode_header,
+    factor_codes_and_categories,
     is_buffer_source,
     open_rds_stream,
     posixlt_wall_clock_components,
@@ -58,7 +63,7 @@ RDSSource: TypeAlias = (
 class RFileInfo:
     path: Path
     size_bytes: int
-    compression: Literal["none", "gzip", "bzip2", "xz"]
+    compression: Literal["none", "gzip", "bzip2", "xz", "zstd"]
     container: Literal["rds", "rdata", "unknown"]
     serialization: Literal["xdr", "native", "ascii", "unknown"]
     fast_supported: bool
@@ -180,13 +185,18 @@ class _SelectionPlan:
     names: dict[int, str] | None
 
 
+def compiled_backend_available() -> bool:
+    """Return whether this installation loaded the optional compiled scanner."""
+    return CYTHON_ACCELERATOR_AVAILABLE
+
+
 def materialize_uncompressed(
     path: os.PathLike[str] | str,
     destination: os.PathLike[str] | str | None = None,
 ) -> Path:
     """Decompress an RDS container to disk once so later reads can seek.
 
-    Compressed RDS (gzip/bzip2/xz) cannot seek: skipping an unselected
+    Compressed RDS (gzip/bzip2/xz/zstd) cannot seek: skipping an unselected
     payload still decompresses its bytes. Applications that repeatedly and
     selectively access one large compressed file can pay the decompression
     once, then run every later `list`/`extract`/`columns=` operation against
@@ -241,6 +251,8 @@ def inspect_r_file(path: os.PathLike[str] | str) -> RFileInfo:
         compression = "bzip2"
     elif magic.startswith(b"\xfd7zXZ\x00"):
         compression = "xz"
+    elif magic.startswith(ZSTD_MAGIC):
+        compression = "zstd"
     else:
         compression = "none"
     with open_rds_stream(source) as (stream, _raw, _compression):
@@ -272,6 +284,7 @@ def inspect_r_file(path: os.PathLike[str] | str) -> RFileInfo:
 def list_rds_tables(
     path: os.PathLike[str] | str,
     *,
+    cache: bool | os.PathLike[str] | str = False,
     progress: ProgressCallback | None = None,
     limits: ReaderLimits | None = None,
 ) -> RDSCatalog:
@@ -280,8 +293,26 @@ def list_rds_tables(
     The stream is still traversed because R stores list names after its elements.
     Numeric, raw, complex, and character payloads are discarded with bounded
     memory; no pandas, NumPy column, Arrow table, or temporary Parquet is created.
+
+    ``cache=True`` reuses ``<source>.rdsframe.json`` when its absolute path,
+    size, and nanosecond modification time still match, otherwise rebuilding
+    it atomically. Pass a path instead of ``True`` to choose the sidecar name.
     """
     source = _validate_source(path).resolve()
+    cache_path = _catalog_cache_path(source, cache)
+    if cache_path is not None and cache_path.is_file():
+        try:
+            cached = RDSCatalog.load(cache_path)
+        except RDSCatalogError:
+            # A partial/corrupt sidecar is only a cache miss. The explicit
+            # RDSCatalog.load() API remains strict for callers that want to
+            # validate a user-supplied catalog rather than rebuild it.
+            pass
+        else:
+            if cached.matches(source):
+                _emit_progress(progress, 0)
+                _emit_progress(progress, 100)
+                return cached
     stat = source.stat()
     file_info = inspect_r_file(source)
     _emit_progress(progress, 0)
@@ -318,6 +349,13 @@ def list_rds_tables(
                     raise UnsupportedRDS("root list contains non-data.frame elements")
                 frames.append(frame)
             root_attributes = reader.read_attributes() if root_header[2] else {}
+            if "data.frame" in as_strings(root_attributes.get("class")):
+                # The root looked like a list of tables (its first child is a
+                # data.frame), but the class attribute -- which R serializes
+                # last -- reveals a data.frame whose columns are data.frames.
+                raise UnsupportedRDS(
+                    "data.frame-valued data.frame columns are not supported"
+                )
             names = as_strings(root_attributes.get("names"))
             table_info = tuple(
                 RTableInfo(
@@ -349,13 +387,34 @@ def list_rds_tables(
                 RTableInfo(0, "data", frame.rows, frame.columns, frame.column_names),
             )
     _emit_progress(progress, 100)
-    return RDSCatalog(
+    catalog = RDSCatalog(
         source,
         stat.st_size,
         stat.st_mtime_ns,
         file_info.compression,
         table_info,
     )
+    current_stat = source.stat()
+    if (
+        current_stat.st_size != stat.st_size
+        or current_stat.st_mtime_ns != stat.st_mtime_ns
+    ):
+        raise RDSCatalogError("source file changed while its catalog was being built")
+    if cache_path is not None:
+        catalog.save(cache_path)
+    return catalog
+
+
+def _catalog_cache_path(source: Path, cache: bool | os.PathLike[str] | str) -> Path | None:
+    """Resolve the opt-in catalog sidecar without touching the filesystem."""
+    if cache is False:
+        return None
+    if cache is True:
+        return source.with_suffix(".rdsframe.json")
+    result = Path(cache).expanduser().resolve()
+    if result == source:
+        raise ValueError("catalog cache path must differ from the RDS source")
+    return result
 
 
 def read_rds(
@@ -422,6 +481,62 @@ def read_rds(
         )
         root = reader.read_item()
     result = _root_to_frames(root, strings=strings)
+    _emit_progress(progress, 100)
+    return result
+
+
+def read_rds_arrow(
+    path: RDSSource,
+    *,
+    progress: ProgressCallback | None = None,
+    limits: ReaderLimits | None = None,
+    posixct_mode: Literal["preserve", "utc_naive"] = "preserve",
+    invalid_timestamp: Literal["error", "null"] = "error",
+    list_column_mode: Literal["infer", "json", "string"] = "infer",
+    encoding: str | None = None,
+) -> Any:
+    """Read a data.frame or named list of data.frames as Arrow tables.
+
+    This path never constructs pandas objects. String columns are parsed into
+    Arrow buffers directly; numeric columns retain their NumPy-backed buffers
+    until Arrow adopts them. The complete selected R object must still fit in
+    memory.
+    """
+    if posixct_mode not in {"preserve", "utc_naive"}:
+        raise ValueError("posixct_mode must be 'preserve' or 'utc_naive'")
+    if invalid_timestamp not in {"error", "null"}:
+        raise ValueError("invalid_timestamp must be 'error' or 'null'")
+    if list_column_mode not in {"infer", "json", "string"}:
+        raise ValueError("list_column_mode must be 'infer', 'json', or 'string'")
+    try:
+        import pyarrow  # type: ignore[import-untyped]  # noqa: F401
+    except ImportError as exc:
+        raise ImportError("Arrow reads require: pip install 'rdsframe[arrow]'") from exc
+
+    source, total_bytes = _coerce_read_source(path)
+    _emit_progress(progress, 0)
+    with open_rds_stream(source) as (stream, raw, _compression):
+        version, byteorder, declared_encoding = decode_header(stream)
+        if version not in {2, 3}:
+            raise UnsupportedRDS(f"serialization version {version} is not supported")
+        reader = Reader(
+            stream,
+            byteorder=byteorder,
+            limits=limits or ReaderLimits(),
+            progress=progress,
+            total_bytes=total_bytes,
+            compressed_position=raw.tell,
+            arrow_strings=True,
+            native_encoding=resolve_native_encoding(declared_encoding, encoding),
+            utf8_fallback=encoding,
+        )
+        root = reader.read_item()
+    result = _root_to_arrow(
+        root,
+        posixct_mode=posixct_mode,
+        invalid_timestamp=invalid_timestamp,
+        list_column_mode=list_column_mode,
+    )
     _emit_progress(progress, 100)
     return result
 
@@ -497,6 +612,8 @@ def _read_dataframe_selective(
             name = names[index] if index < len(names) and names[index] else f"V{index + 1}"
             key = _unique_name(name, data)
             data[key] = _column_to_pandas(raw_columns[index], strings=strings)
+        if len({len(vector) for vector in data.values()}) > 1:
+            raise InvalidRDS("data.frame columns have different lengths")
         frame = pd.DataFrame(data, copy=False)
         frame = _apply_row_names(frame, attributes)
     _emit_progress(progress, 100)
@@ -602,11 +719,10 @@ def read_r_object(
     handling) but are unwrapped to a plain Python scalar or list rather than
     a pandas Series, and a length-1 result is returned as a bare scalar.
 
-    Object types outside R's data-representation model -- environments,
-    closures, S4/R6 objects, promises, language calls, external pointers --
-    still are not supported and raise :class:`UnsupportedRDS` or
-    :class:`InvalidRDS`, matching the parser's overall "fail explicitly"
-    contract. This is a general-purpose, exploratory reader, not a
+    Supported environments preserve shared references and self-cycles when
+    converted to Python dictionaries; S4 objects become dictionaries of slots.
+    Closures, promises, language calls, and external pointers still fail
+    explicitly. This is a general-purpose, exploratory reader, not a
     performance-tuned path: it is not streaming and materializes the whole
     structure, like :func:`read_rds`.
 
@@ -638,8 +754,12 @@ def read_r_object(
 
 
 def _serialized_to_python(
-    node: Any, *, strings: Literal["object", "string", "pyarrow"]
+    node: Any,
+    *,
+    strings: Literal["object", "string", "pyarrow"],
+    _memo: dict[int, Any] | None = None,
 ) -> Any:
+    memo = {} if _memo is None else _memo
     if node is None:
         return None
     if isinstance(node, tuple) and len(node) == 2:
@@ -656,33 +776,58 @@ def _serialized_to_python(
         if kind == "environment":  # pragma: no cover - defensive
             return payload
     if isinstance(node, SerializedObject) and node.sexp_type == ENVSXP:
-        return {
-            key: _serialized_to_python(item, strings=strings)
-            for key, item in node.value.items()
-        }
+        identity = id(node)
+        if identity in memo:
+            return memo[identity]
+        environment: dict[str, Any] = {}
+        memo[identity] = environment
+        environment.update(
+            {
+                key: _serialized_to_python(item, strings=strings, _memo=memo)
+                for key, item in node.value.items()
+            }
+        )
+        return environment
     if isinstance(node, SerializedObject) and node.sexp_type == S4SXP:
-        result: dict[str, Any] = {
+        identity = id(node)
+        if identity in memo:
+            return memo[identity]
+        s4_result: dict[str, Any] = {
             "$r_class": as_strings(node.attributes.get("class")) or None
         }
+        memo[identity] = s4_result
         for key, item in node.attributes.items():
             if key != "class":
-                result[key] = _serialized_to_python(item, strings=strings)
-        return result
+                s4_result[key] = _serialized_to_python(
+                    item, strings=strings, _memo=memo
+                )
+        return s4_result
     if isinstance(node, SerializedObject) and node.sexp_type == VECSXP:
         if _is_dataframe(node):
             return _to_dataframe(node, strings=strings)
         if "POSIXlt" in as_strings(node.attributes.get("class")):
             return _vector_to_python(node, strings=strings)
+        identity = id(node)
+        if identity in memo:
+            return memo[identity]
         names = (
             as_strings(node.attributes["names"]) if "names" in node.attributes else []
         )
-        items = [_serialized_to_python(item, strings=strings) for item in node.value]
-        if names and len(names) == len(items):
+        if names and len(names) == len(node.value):
             result: dict[str, Any] = {}
-            for index, (name, item) in enumerate(zip(names, items, strict=True)):
+            memo[identity] = result
+            for index, (name, item) in enumerate(zip(names, node.value, strict=True)):
                 key = _unique_name(name or f"_unnamed_{index + 1}", result)
-                result[key] = item
+                result[key] = _serialized_to_python(
+                    item, strings=strings, _memo=memo
+                )
             return result
+        items: list[Any] = []
+        memo[identity] = items
+        items.extend(
+            _serialized_to_python(item, strings=strings, _memo=memo)
+            for item in node.value
+        )
         return items
     if isinstance(node, SerializedObject):
         return _vector_to_python(node, strings=strings)
@@ -691,22 +836,113 @@ def _serialized_to_python(
     return node
 
 
+# Atomic vector types eligible for the no-pandas fast path below.
+_PLAIN_SEXP_TYPES = frozenset({INTSXP, REALSXP, LGLSXP, STRSXP, CPLXSXP, RAWSXP})
+
+
+def _plain_vector_values(
+    column: SerializedObject, *, strings: Literal["object", "string", "pyarrow"]
+) -> list[Any] | None:
+    """Convert a class-less atomic vector to a list without pandas.
+
+    This is the hot path for files that are large *lists* of small vectors
+    (real example: an R help-alias index with 24k entries spent ~80% of its
+    read time constructing throwaway pandas Series). The output matches the
+    pandas round-trip exactly: missing integers/logicals become ``pd.NA``,
+    ``NA_character_`` stays ``None`` in object mode and ``pd.NA`` otherwise,
+    and R's ``NA_real_`` remains NaN. Returns None when the value shape is
+    unexpected so the caller can fall back to the pandas path.
+    """
+    sexp_type, value = column.sexp_type, column.value
+    if sexp_type == STRSXP:
+        if isinstance(value, list):
+            items = value
+        elif hasattr(value, "to_pylist"):  # pyarrow-backed strings
+            items = value.to_pylist()
+        else:
+            return None
+        if strings == "object":
+            return list(items)
+        return [pd.NA if item is None else item for item in items]
+    if not isinstance(value, np.ndarray):
+        return None
+    if sexp_type in {REALSXP, CPLXSXP, RAWSXP}:
+        return cast("list[Any]", value.tolist())
+    if sexp_type == INTSXP:
+        items = value.tolist()
+        if (value == NA_INTEGER).any():
+            return [pd.NA if item == NA_INTEGER else item for item in items]
+        return cast("list[Any]", items)
+    if sexp_type == LGLSXP:
+        return [pd.NA if item == NA_INTEGER else item == 1 for item in value.tolist()]
+    return None
+
+
+def _matrix_to_numpy(
+    column: SerializedObject, *, strings: Literal["object", "string", "pyarrow"]
+) -> np.ndarray[Any, Any]:
+    """Reshape a dim-carrying vector column-major with its native dtype.
+
+    ``dimnames`` are not represented: a bare ndarray has nowhere to carry
+    them. Vectors with a class or missing integers/logicals fall back to an
+    object array via the generic conversion (missing values need a Python
+    sentinel there).
+    """
+    attributes = column.attributes
+    sexp_type, value = column.sexp_type, column.value
+    shape = tuple(int(size) for size in as_value(attributes["dim"]).tolist())
+    length = len(value) if isinstance(value, (np.ndarray, list)) else None
+    if length is not None and int(np.prod(shape)) != length:
+        raise InvalidRDS("dim attribute does not match the vector length")
+    plain = not (attributes.keys() - {"dim", "dimnames"})
+    if plain and isinstance(value, np.ndarray):
+        if sexp_type in {REALSXP, CPLXSXP, RAWSXP}:
+            return value.reshape(shape, order="F")
+        if sexp_type == INTSXP and not (value == NA_INTEGER).any():
+            return value.reshape(shape, order="F")
+        if sexp_type == LGLSXP and not (value == NA_INTEGER).any():
+            booleans: np.ndarray[Any, Any] = value == 1
+            return booleans.reshape(shape, order="F")
+    stripped = SerializedObject(
+        value,
+        {k: v for k, v in attributes.items() if k not in {"dim", "dimnames"}},
+        sexp_type,
+    )
+    flat = _vector_to_python(stripped, strings=strings)
+    flat_list = flat if isinstance(flat, list) else [flat]
+    return np.array(flat_list, dtype=object).reshape(shape, order="F")
+
+
 def _vector_to_python(
     column: SerializedObject, *, strings: Literal["object", "string", "pyarrow"]
 ) -> Any:
-    dim = column.attributes.get("dim")
-    if dim is not None:
-        stripped = SerializedObject(
-            column.value,
-            {key: value for key, value in column.attributes.items() if key != "dim"},
-            column.sexp_type,
-        )
-        flat = _vector_to_python(stripped, strings=strings)
-        shape = tuple(int(size) for size in as_value(dim).tolist())
-        flat_list = flat if isinstance(flat, list) else [flat]
-        return np.array(flat_list, dtype=object).reshape(shape, order="F")
-    series = pd.Series(_column_to_pandas(column, strings=strings))
-    values = series.tolist()
+    attributes = column.attributes
+    if attributes.get("dim") is not None:
+        return _matrix_to_numpy(column, strings=strings)
+    values: list[Any] | None = None
+    if column.sexp_type in _PLAIN_SEXP_TYPES and not (attributes.keys() - {"names"}):
+        values = _plain_vector_values(column, strings=strings)
+    if values is None:
+        converted = _column_to_pandas(column, strings=strings)
+        if isinstance(converted, np.ndarray) and converted.dtype.kind in {"M", "m"}:
+            # NumPy's direct tolist() returns datetime/date/timedelta objects;
+            # preserve the public read_r_object() contract of pandas scalars.
+            values = cast("list[Any]", pd.Index(converted).tolist())
+        elif hasattr(converted, "tolist"):
+            values = cast("list[Any]", converted.tolist())
+        else:
+            values = list(converted)
+    if column.sexp_type != VECSXP:
+        # A named atomic vector is R's lightweight mapping; dropping the
+        # names would lose half the data. (VECSXP is excluded: it reaches
+        # this function only as POSIXlt, whose names are component labels.)
+        names = as_strings(attributes.get("names")) if "names" in attributes else []
+        if names and len(names) == len(values):
+            result: dict[str, Any] = {}
+            for index, (name, item) in enumerate(zip(names, values, strict=True)):
+                key = _unique_name(name or f"_unnamed_{index + 1}", result)
+                result[key] = item
+            return result
     return values[0] if len(values) == 1 else values
 
 
@@ -715,6 +951,7 @@ def to_parquet(
     destination: os.PathLike[str] | str,
     *,
     basename: str | None = None,
+    engine: Literal["auto", "duckdb", "pyarrow"] = "auto",
     compression: str = "zstd",
     row_group_size: int = 250_000,
     memory_limit: str | None = "1GB",
@@ -733,20 +970,25 @@ def to_parquet(
     limits: ReaderLimits | None = None,
     encoding: str | None = None,
 ) -> list[ParquetTable]:
-    """Incrementally convert RDS data.frames to query-ready Parquet.
+    """Convert RDS data.frames to query-ready Parquet.
 
-    Columns are parsed and staged one at a time, then DuckDB combines them into
-    the final file. Peak parser memory is therefore tied mainly to the largest
-    individual column rather than the complete table. Existing destination files
-    are replaced only after a complete result has been written.
+    ``engine="auto"`` uses the memory-bounded DuckDB pipeline when DuckDB is
+    installed and otherwise falls back to PyArrow. The PyArrow engine has no
+    DuckDB dependency, but materializes each Arrow table before writing it.
+    Existing destination files are replaced only after a complete result has
+    been written.
 
     ``encoding`` overrides the codec for CHARSXP elements with no explicit
     UTF-8/ASCII/latin-1 flag; see :func:`read_rds` for the default-resolution
     rule (the RDS header's own declared encoding, when present, else UTF-8).
     """
     source = _validate_source(path)
+    if engine not in {"auto", "duckdb", "pyarrow"}:
+        raise ValueError("engine must be 'auto', 'duckdb', or 'pyarrow'")
     if stage_max_columns < 1:
         raise ValueError("stage_max_columns must be at least 1")
+    if row_group_size < 1:
+        raise ValueError("row_group_size must be at least 1")
     if stage_max_bytes < 1:
         raise ValueError("stage_max_bytes must be at least 1")
     if gc_collect_every < 0:
@@ -765,6 +1007,28 @@ def to_parquet(
     out_dir = Path(destination)
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = _safe_name(basename or source.stem, 0)
+    resolved_engine = engine
+    if resolved_engine == "auto":
+        resolved_engine = (
+            "duckdb" if importlib.util.find_spec("duckdb") is not None else "pyarrow"
+        )
+    if resolved_engine == "pyarrow":
+        return _pyarrow_to_parquet(
+            source,
+            out_dir=out_dir,
+            basename=stem,
+            compression=compression,
+            row_group_size=row_group_size,
+            max_tables=max_tables,
+            max_root_items=max_root_items,
+            posixct_mode=posixct_mode,
+            invalid_timestamp=invalid_timestamp,
+            list_column_mode=list_column_mode,
+            selection=selection,
+            progress=progress,
+            limits=limits,
+            encoding=encoding,
+        )
     _emit_progress(progress, 0)
     with open_rds_stream(source) as (stream, raw, _compression):
         version, byteorder, declared_encoding = decode_header(stream)
@@ -808,6 +1072,109 @@ def to_parquet(
         )
     _emit_progress(progress, 100)
     return [ParquetTable(name, path, rows, columns) for name, path, rows, columns in raw_results]
+
+
+def _pyarrow_to_parquet(
+    source: Path,
+    *,
+    out_dir: Path,
+    basename: str,
+    compression: str,
+    row_group_size: int,
+    max_tables: int | None,
+    max_root_items: int | None,
+    posixct_mode: Literal["preserve", "utc_naive"],
+    invalid_timestamp: Literal["error", "null"],
+    list_column_mode: Literal["infer", "json", "string"],
+    selection: _SelectionPlan | None,
+    progress: ProgressCallback | None,
+    limits: ReaderLimits | None,
+    encoding: str | None,
+) -> list[ParquetTable]:
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise ImportError("Parquet export requires: pip install 'rdsframe[parquet]'") from exc
+
+    arrow_root = read_rds_arrow(
+        source,
+        progress=progress,
+        limits=limits,
+        posixct_mode=posixct_mode,
+        invalid_timestamp=invalid_timestamp,
+        list_column_mode=list_column_mode,
+        encoding=encoding,
+    )
+    multiple = isinstance(arrow_root, dict)
+    if multiple:
+        all_tables = list(arrow_root.items())
+        if max_root_items is not None and len(all_tables) > max_root_items:
+            raise RDSLimitError(
+                f"root object contains {len(all_tables):,} items; configured limit is "
+                f"{max_root_items:,}"
+            )
+        if max_tables is not None and len(all_tables) > max_tables:
+            raise RDSLimitError(
+                f"RDS contains {len(all_tables):,} data.frames; configured limit is "
+                f"{max_tables:,}. No partial output was written."
+            )
+        if selection is not None:
+            invalid = sorted(
+                index
+                for index in selection.indices
+                if index < 0 or index >= len(all_tables)
+            )
+            if invalid:
+                raise RDSCatalogError(
+                    f"table indices out of range for {len(all_tables)} tables: {invalid}"
+                )
+            all_tables = [
+                item for index, item in enumerate(all_tables) if index in selection.indices
+            ]
+    else:
+        if not isinstance(arrow_root, pa.Table):  # pragma: no cover - defensive
+            raise UnsupportedRDS("Arrow conversion did not produce a table")
+        if max_root_items is not None and arrow_root.num_columns > max_root_items:
+            raise RDSLimitError(
+                f"root object contains {arrow_root.num_columns:,} items; configured limit is "
+                f"{max_root_items:,}"
+            )
+        if selection is not None and selection.indices != frozenset({0}):
+            raise RDSCatalogError(
+                "the RDS contains one root data.frame; only table index 0 is valid"
+            )
+        all_tables = [("data", arrow_root)]
+
+    normalized_compression: str | None = compression.lower()
+    if normalized_compression in {"none", "uncompressed"}:
+        normalized_compression = None
+    stage_root = Path(tempfile.mkdtemp(prefix=".rdsframe-", dir=out_dir))
+    staged: list[tuple[str, Path, Path, Any]] = []
+    try:
+        for index, (name, table) in enumerate(all_tables):
+            final = (
+                out_dir / f"{basename}__{name}.parquet"
+                if multiple
+                else out_dir / f"{basename}.parquet"
+            )
+            pending = stage_root / f"table-{index}.parquet"
+            pq.write_table(
+                table,
+                pending,
+                compression=normalized_compression,
+                row_group_size=row_group_size,
+            )
+            staged.append((name, pending, final, table))
+        results: list[ParquetTable] = []
+        for name, pending, final, table in staged:
+            os.replace(pending, final)
+            results.append(
+                ParquetTable(name, final, table.num_rows, table.num_columns)
+            )
+        return results
+    finally:
+        shutil.rmtree(stage_root, ignore_errors=True)
 
 
 def extract_rds_tables(
@@ -898,7 +1265,7 @@ def _resolve_table_selection(
     if catalog is not None and not catalog.matches(path):
         raise RDSCatalogError("catalog is stale or belongs to a different source file")
     if any(isinstance(item, str) for item in requested) and catalog is None:
-        catalog = list_rds_tables(path)
+        catalog = list_rds_tables(path, cache=True)
 
     by_name: dict[str, list[int]] = {}
     if catalog is not None:
@@ -960,6 +1327,71 @@ def _root_to_frames(
     return result
 
 
+def _root_to_arrow(
+    root: Any,
+    *,
+    posixct_mode: Literal["preserve", "utc_naive"],
+    invalid_timestamp: Literal["error", "null"],
+    list_column_mode: Literal["infer", "json", "string"],
+) -> Any:
+    if _is_dataframe(root):
+        return _to_arrow_table(
+            root,
+            posixct_mode=posixct_mode,
+            invalid_timestamp=invalid_timestamp,
+            list_column_mode=list_column_mode,
+        )
+    if not isinstance(root, SerializedObject) or root.sexp_type != VECSXP:
+        raise UnsupportedRDS("root object is not a data.frame or list of data.frames")
+    items = root.value
+    if not items or not all(_is_dataframe(item) for item in items):
+        raise UnsupportedRDS("root list contains non-data.frame elements")
+    names = as_strings(root.attributes.get("names"))
+    result: dict[str, Any] = {}
+    for index, item in enumerate(items):
+        name = _unique_name(
+            _safe_name(names[index] if index < len(names) else "", index), result
+        )
+        result[name] = _to_arrow_table(
+            item,
+            posixct_mode=posixct_mode,
+            invalid_timestamp=invalid_timestamp,
+            list_column_mode=list_column_mode,
+        )
+    return result
+
+
+def _to_arrow_table(
+    obj: SerializedObject,
+    *,
+    posixct_mode: Literal["preserve", "utc_naive"],
+    invalid_timestamp: Literal["error", "null"],
+    list_column_mode: Literal["infer", "json", "string"],
+) -> Any:
+    import pyarrow as pa
+
+    from ._parquet import _column_to_arrow
+
+    columns = obj.value
+    names = as_strings(obj.attributes.get("names"))
+    if not names:
+        names = [f"V{index + 1}" for index in range(len(columns))]
+    if len(names) != len(columns):
+        raise InvalidRDS("data.frame column-name count does not match column count")
+    data: dict[str, Any] = {}
+    for index, (name, column) in enumerate(zip(names, columns, strict=True)):
+        key = _unique_name(name or f"V{index + 1}", data)
+        data[key] = _column_to_arrow(
+            column,
+            posixct_mode=posixct_mode,
+            invalid_timestamp=invalid_timestamp,
+            list_column_mode=list_column_mode,
+        )
+    if len({len(vector) for vector in data.values()}) > 1:
+        raise InvalidRDS("data.frame columns have different lengths")
+    return pa.table(data)
+
+
 def _is_dataframe(obj: Any) -> bool:
     return (
         isinstance(obj, SerializedObject)
@@ -981,10 +1413,10 @@ def _to_dataframe(
     for index, (name, column) in enumerate(zip(names, columns, strict=True)):
         key = _unique_name(name or f"V{index + 1}", data)
         data[key] = _column_to_pandas(column, strings=strings)
-    frame = pd.DataFrame(data, copy=False)
-    lengths = {len(series) for series in data.values()}
+    lengths = {len(vector) for vector in data.values()}
     if len(lengths) > 1:
         raise InvalidRDS("data.frame columns have different lengths")
+    frame = pd.DataFrame(data, copy=False)
     return _apply_row_names(frame, obj.attributes)
 
 
@@ -1018,9 +1450,16 @@ def _apply_row_names(frame: pd.DataFrame, attributes: dict[str, Any]) -> pd.Data
 
 def _column_to_pandas(
     column: Any, *, strings: Literal["object", "string", "pyarrow"]
-) -> pd.Series[Any] | pd.Categorical:
+) -> Any:
+    """Convert one parsed R vector to a pandas-ready 1-D value.
+
+    Returns an ndarray, ExtensionArray, Categorical, Index, or Series.
+    Array-like (non-Series) returns are deliberate: building a DataFrame
+    from a dict of arrays skips the per-column index alignment that a dict
+    of Series pays, which dominates files with very many small tables.
+    """
     if not isinstance(column, SerializedObject):
-        return pd.Series(column if isinstance(column, np.ndarray) else np.asarray(column))
+        return column if isinstance(column, np.ndarray) else np.asarray(column)
     value, attributes, sexp_type = column.value, column.attributes, column.sexp_type
     if attributes.get("dim") is not None:
         raise UnsupportedRDS(
@@ -1030,11 +1469,7 @@ def _column_to_pandas(
     if sexp_type == INTSXP:
         levels = attributes.get("levels")
         if "factor" in classes and levels is not None:
-            categories = as_strings(levels)
-            codes = np.where(value == NA_INTEGER, -1, value.astype(np.int64) - 1).astype(
-                np.int64
-            )
-            codes[(codes < -1) | (codes >= len(categories))] = -1
+            codes, categories = factor_codes_and_categories(value, levels)
             return cast(
                 pd.Categorical,
                 pd.Categorical.from_codes(
@@ -1044,56 +1479,116 @@ def _column_to_pandas(
         if "Date" in classes:
             numeric = value.astype(np.float64)
             numeric[value == NA_INTEGER] = np.nan
-            return pd.Series(pd.to_datetime(numeric, unit="D", origin="unix"))
+            return _numpy_temporal(numeric, seconds_per_unit=86_400, kind="datetime")
+        if "POSIXct" in classes or "difftime" in classes:
+            # R allows integer storage.mode for these classes (common in
+            # DB-imported frames). Normalize to the REALSXP rules so the
+            # time semantics survive instead of decaying to plain integers.
+            numeric = value.astype(np.float64)
+            numeric[value == NA_INTEGER] = np.nan
+            return _column_to_pandas(
+                SerializedObject(numeric, attributes, REALSXP), strings=strings
+            )
         if np.any(value == NA_INTEGER):
-            return pd.Series(pd.array(value, dtype="Int32")).mask(value == NA_INTEGER)
-        return pd.Series(value, copy=False)
+            masked = pd.array(value, dtype="Int32")
+            masked[value == NA_INTEGER] = pd.NA
+            return masked
+        return value
     if sexp_type == REALSXP:
         if "Date" in classes:
-            return pd.Series(pd.to_datetime(value, unit="D", origin="unix"))
+            return _numpy_temporal(value, seconds_per_unit=86_400, kind="datetime")
         if "POSIXct" in classes:
             timezone = next(iter(as_strings(attributes.get("tzone"))), "")
-            safe = value.copy()
-            safe[~np.isfinite(safe)] = np.nan
-            dates = pd.to_datetime(
-                safe,
-                unit="s",
-                origin="unix",
-                utc=bool(timezone),
-                errors="coerce",
+            dates: Any = _numpy_temporal(
+                value, seconds_per_unit=1, kind="datetime"
             )
+            if timezone:
+                dates = pd.DatetimeIndex(dates).tz_localize("UTC")
             if timezone and timezone not in {"UTC", "GMT"}:
                 with suppress(KeyError, ValueError):
                     dates = dates.tz_convert(timezone)
-            return pd.Series(dates)
+            return dates
         if "difftime" in classes:
             unit = next(iter(as_strings(attributes.get("units"))), "secs")
             seconds_per_unit = DIFFTIME_SECONDS_PER_UNIT.get(unit)
             if seconds_per_unit is None:
                 raise UnsupportedRDS(f"difftime unit {unit!r} is not supported")
-            return pd.Series(pd.to_timedelta(value * seconds_per_unit, unit="s"))
-        return pd.Series(value, copy=False)
+            return _numpy_temporal(
+                value, seconds_per_unit=seconds_per_unit, kind="timedelta"
+            )
+        return value
     if sexp_type == LGLSXP:
         result = pd.array(value == 1, dtype="boolean")
         result[value == NA_INTEGER] = pd.NA
-        return pd.Series(result)
+        return result
     if sexp_type == STRSXP:
-        dtype = "string[pyarrow]" if strings == "pyarrow" else (
-            "string" if strings == "string" else "object"
-        )
-        return pd.Series(value, dtype=dtype, copy=False)
+        if strings == "object":
+            # An object Index prevents pandas 3 from inferring its new ``str``
+            # dtype (which turns None into NaN) without paying Series alignment.
+            return pd.Index(value, dtype=object)
+        dtype = "string[pyarrow]" if strings == "pyarrow" else "string"
+        return pd.array(value, dtype=dtype, copy=False)
     if sexp_type == CPLXSXP:
-        return pd.Series(value, copy=False)
+        return value
     if sexp_type == RAWSXP:
-        return pd.Series(value, dtype="uint8", copy=False)
+        return value
     if sexp_type == VECSXP:
+        if "data.frame" in classes:
+            # A nested data.frame is a VECSXP of its *columns*: falling
+            # through to the list-column path would present those columns as
+            # row values (silently transposed whenever the nested frame
+            # happens to be square).
+            raise UnsupportedRDS(
+                "data.frame-valued data.frame columns are not supported"
+            )
         if "POSIXlt" in classes:
             return _posixlt_to_pandas(column)
-        return pd.Series([_element_to_python(item) for item in value], dtype="object")
+        result = np.empty(len(value), dtype=object)
+        result[:] = [_element_to_python(item) for item in value]
+        return result
     raise UnsupportedRDS(f"data.frame column SEXP type {sexp_type} is unsupported")
 
 
-def _posixlt_to_pandas(column: SerializedObject) -> pd.Series[Any]:
+def _numpy_temporal(
+    value: np.ndarray[Any, Any],
+    *,
+    seconds_per_unit: float,
+    kind: Literal["datetime", "timedelta"],
+) -> np.ndarray[Any, Any]:
+    """Convert R epoch values with NumPy, avoiding pandas per-column setup.
+
+    Integral values use second resolution, which keeps pandas 3's extended
+    timestamp range. Fractional values use nanoseconds for the same precision
+    as ``pd.to_datetime``; values outside that representation become ``NaT``.
+    """
+    numeric = np.asarray(value, dtype=np.float64)
+    with np.errstate(invalid="ignore", over="ignore"):
+        seconds = numeric * seconds_per_unit
+    finite = np.isfinite(seconds)
+    fractional = bool(np.any(seconds[finite] != np.trunc(seconds[finite])))
+    unit = "ns" if fractional else "s"
+    scale = 1_000_000_000 if fractional else 1
+    scaled = np.zeros(numeric.shape, dtype=np.float64)
+    with np.errstate(invalid="ignore", over="ignore"):
+        scaled[finite] = np.rint(seconds[finite] * scale)
+    # int64's minimum value is NumPy's NaT sentinel and is therefore excluded.
+    valid = finite & (scaled > -(2**63)) & (scaled < 2**63)
+    dtype = np.dtype(f"{kind}64[{unit}]")
+    nat: Any
+    if kind == "datetime":
+        nat = np.datetime64("NaT", "ns") if fractional else np.datetime64("NaT", "s")
+    else:
+        nat = (
+            np.timedelta64("NaT", "ns")
+            if fractional
+            else np.timedelta64("NaT", "s")
+        )
+    result = np.full(numeric.shape, nat, dtype=dtype)
+    result[valid] = scaled[valid].astype(np.int64).astype(dtype)
+    return result
+
+
+def _posixlt_to_pandas(column: SerializedObject) -> pd.DatetimeIndex:
     """Reconstruct wall-clock `pandas.Timestamp`s from a `POSIXlt` list.
 
     Each row's `year`/`mon`/`mday`/`hour`/`min`/`sec` components are combined
@@ -1133,7 +1628,7 @@ def _posixlt_to_pandas(column: SerializedObject) -> pd.Series[Any]:
             )
         except (ValueError, OverflowError):
             continue
-    return pd.Series(pd.to_datetime(timestamps))
+    return pd.DatetimeIndex(timestamps)
 
 
 def _element_to_python(element: Any) -> Any:

@@ -69,8 +69,69 @@ drain. Same environment and files as above, one warm run each:
 | `read_rds()`, 186 MiB uncompressed, 557k rows x 33 cols | 4.6s | 3.0s | — |
 | `to_parquet()` of one 589k-row table with catalog | — | 5.0s | — |
 
-The remaining listing time is dominated by per-element loop iterations in
-pure Python over ~44M string headers; the stream-call overhead is gone.
-Parallelizing independent columns across processes is the next lever, but
-requires either a seekable (uncompressed) source or per-column
-re-decompression, and is out of scope for this release.
+The remaining listing time was dominated by per-element loop iterations in
+pure Python over ~44M string headers; the stream-call overhead was gone.
+
+## Optional Cython scanner and pandas tiny-table path (2026-07-16)
+
+Environment: Windows, Python 3.12.13, pandas 3.0.3, NumPy 2.5.1. Each number is
+one fresh-process run against the real local audit files. The compiled module
+owns no I/O or parser state: it scans buffered CHARSXP elements only and
+returns to the Python Reader for refills, limits, progress, and exceptions.
+
+| Input / operation | Python fallback | Cython | Speedup |
+| --- | ---: | ---: | ---: |
+| `datos_limpios.rds`: `list_rds_tables()` | 16.692s | 3.866s | 4.32x |
+
+The fallback was forced with `RDSFRAME_DISABLE_CYTHON=1` and the full suite was
+run both ways. Vectors below 1,024 elements stay on the Python batch loop: the
+extension-call/memoryview setup costs more than it saves at that size. For
+`archive.rds` (27,315 tiny tables), replacing Series/index
+alignment and pandas datetime conversion with array-like/NumPy paths reduced
+the unprofiled run from 35.160s to 20.248s. Its residual cost is dominated by
+the 27,315 requested pandas DataFrame objects rather than RDS parsing.
+
+The skip-only comparison is reproducible (and verifies identical catalogs)
+with:
+
+```console
+python benchmarks/benchmark_cython_skip.py ../datos_limpios.rds --repeat 3
+```
+
+A post-change validation run on 2026-07-16 (`--repeat 1`) measured 32.559s for
+Python and 7.147s for Cython, a **4.56x** speedup, with identical catalogs. The
+absolute times moved with machine load; the ratio agrees with the controlled
+4.32x measurement above.
+
+## Cross-reader comparison (2026-07-16)
+
+Environment: Windows 11, Python 3.12.13, pandas 3.0.3, NumPy 2.5.1, pyreadr
+0.5.6 (librdata, C), rdata 1.1.0. Each cell is one cold run in a fresh
+subprocess; peak RSS is the process `PeakWorkingSetSize`. Synthetic inputs
+were generated with R 4.5.0 (2M x 8 numeric; 1M x 5 text with mixed
+cardinality); the real inputs are nflverse `play_by_play_2023.rds` (gzip,
+49,665 x 372) and a 123 MiB gzip production file whose root is a named list
+of 6 data.frames (~5.2M rows total).
+
+| Input / reader | rdsframe | pyreadr | rdata |
+| --- | ---: | ---: | ---: |
+| numeric 2M x 8, uncompressed | 0.66 s / 199 MB | 1.82 s / 469 MB | 1.27 s / 490 MB |
+| numeric 2M x 8, gzip | 1.25 s / 208 MB | 2.27 s / 469 MB | 1.78 s / 515 MB |
+| text 1M x 5, uncompressed | 2.63 s / 228 MB | 16.5-17.3 s / 418 MB | 39.3 s / 1,744 MB |
+| text 1M x 5, gzip | 2.83 s / 229 MB | 2.46 s / 418 MB | -- |
+| play-by-play 49,665 x 372 | 4.31 s / 322 MB | 4.73 s / 766 MB | 94.0 s / 3,678 MB |
+| 123 MiB gzip, 6-table list root | 32 s / ~1.7 GB | **`{}`, silent** | impractical |
+| 5.5 MiB gzip, 27,315 tiny tables | 21 s / 773 MB | **`{}`, silent** | 59.4 s / 1,621 MB |
+
+Notes and caveats:
+
+- pyreadr/librdata does not support an RDS whose root is a list of
+  data.frames: it returns an empty dict without raising. The timings shown
+  for those two rows are therefore not comparable -- pyreadr did no work.
+- pyreadr's uncompressed text case was re-run twice (16.5 s, 17.3 s); its
+  gzip path is the fast one. This is a librdata characteristic, not noise.
+- Correctness was cross-checked, not assumed: 372/372 play-by-play columns
+  compare equal against pyreadr, and column checksums (string lengths, sums,
+  level counts) match R 4.5.0 itself on the synthetic text table.
+- `strings="pyarrow"` lowers rdsframe's peak on the text table further
+  (165 MB); `read_rds_arrow()` avoids pandas entirely.

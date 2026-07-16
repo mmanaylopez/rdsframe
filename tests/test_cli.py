@@ -129,3 +129,9 @@ def test_list_and_select_cli_reuse_catalog(
     )
     assert (output / "multiple__labels.parquet").is_file()
     assert not (output / "multiple__numbers.parquet").exists()
+
+
+def test_list_cli_opt_in_cache(multi_frame_rds: Path, capsys) -> None:
+    assert main(["list", str(multi_frame_rds), "--cache"]) == 0
+    assert "numbers" in capsys.readouterr().out
+    assert multi_frame_rds.with_suffix(".rdsframe.json").is_file()
