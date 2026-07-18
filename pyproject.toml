@@ -76,8 +76,11 @@ build = "cp310-* cp311-* cp312-* cp313-*"
 skip = "*-musllinux_* *_i686 *-win32"
 # A wheel without the compiled scanner must never ship as a binary wheel;
 # platforms outside this matrix fall back to the sdist, where the build is
-# optional and the pure-Python path takes over.
-test-command = 'python -c "import rdsframe; assert rdsframe.compiled_backend_available()"'
+# optional and the pure-Python path takes over. The smoke script goes beyond
+# asserting the extension imports: it reads a synthetic RDS through the
+# compiled scanner and requires identical results from the pure-Python
+# fallback in a RDSFRAME_DISABLE_CYTHON=1 child process.
+test-command = 'python {project}/tools/wheel_smoke.py'
 
 [tool.cibuildwheel.macos]
 archs = ["x86_64", "arm64"]

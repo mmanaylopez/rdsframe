@@ -67,6 +67,12 @@ RDSSource: TypeAlias = (
     "os.PathLike[str] | str | bytes | bytearray | memoryview | BinaryIO"
 )
 
+# pandas < 2 cannot construct a string extension array from the reader's
+# zero-copy pyarrow large_string representation (support for that input
+# landed in pandas 2). Decided once here so the conversion path below can
+# gate on an explicit condition instead of catching broad exceptions.
+_PANDAS_BEFORE_2 = int(pd.__version__.split(".", 1)[0]) < 2
+
 
 @dataclass(frozen=True, slots=True)
 class RFileInfo:
@@ -2070,15 +2076,12 @@ def _column_to_pandas(
             # dtype (which turns None into NaN) without paying Series alignment.
             return pd.Index(value, dtype=object)
         dtype = "string[pyarrow]" if strings == "pyarrow" else "string"
-        try:
-            return pd.array(value, dtype=dtype, copy=False)
-        except (TypeError, ValueError):
-            # pandas < 2 cannot build a string array from the reader's
-            # zero-copy pyarrow large_string representation; only those
-            # versions pay this materializing fallback.
-            if hasattr(value, "to_pylist"):
-                return pd.array(value.to_pylist(), dtype=dtype)
-            raise
+        if _PANDAS_BEFORE_2 and hasattr(value, "to_pylist"):
+            # Explicit version gate (see _PANDAS_BEFORE_2): only pandas < 2
+            # with a pyarrow-backed column pays this materializing fallback;
+            # any other construction failure should surface, not be masked.
+            return pd.array(value.to_pylist(), dtype=dtype)
+        return pd.array(value, dtype=dtype, copy=False)
     if sexp_type == CPLXSXP:
         return value
     if sexp_type == RAWSXP:

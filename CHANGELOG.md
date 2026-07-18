@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- Release engineering (external review follow-up): removed the stale
+  `publish.yml` workflow -- it raced `release.yml` on every `v*` tag and had
+  failed its Trusted Publishing OIDC exchange on every release since
+  v0.4.0b1, leaving a spurious red X; `release.yml` is now the single
+  publishing path. All GitHub Actions are pinned to full commit SHAs instead
+  of mutable tags. Wheel testing goes beyond asserting the compiled scanner
+  imports: `tools/wheel_smoke.py` reads a synthetic RDS through the compiled
+  path (including the >=1024-element string skip loop) and requires identical
+  results from the pure-Python fallback in a `RDSFRAME_DISABLE_CYTHON=1`
+  child process. The minimum-dependencies CI job now also runs the full suite
+  with the compiled backend against NumPy 1.23/pandas 1.5, not only the
+  fallback.
+- The pandas < 2 pyarrow-strings fallback is now an explicit version gate
+  (`_PANDAS_BEFORE_2` plus a `to_pylist` capability check) instead of
+  catching broad `TypeError`/`ValueError`: unforeseen construction failures
+  surface instead of being silently retried.
+- Added `benchmarks/bench.py`: one fresh process per (operation, repetition),
+  median/min/max per category -- catalog scan, pandas read, Arrow read,
+  Polars read -- with the input's compression stated alongside the results.
+
 ## 0.4.0b2 - 2026-07-18
 
 - Fixed: a corrupt or truncated **compressed** RDS container (gzip/bzip2/xz/

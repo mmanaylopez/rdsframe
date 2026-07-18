@@ -3,6 +3,20 @@
 These numbers validate architecture, not universal performance claims. Run the
 same comparison on real files before tuning defaults.
 
+## Reproducing (median + spread)
+
+The historical tables below were single warm-process runs. For new
+measurements use `benchmarks/bench.py`, which runs every (operation,
+repetition) in a fresh Python process and reports median/min/max per
+category -- catalog scan, full pandas read, Arrow read, and Polars read are
+timed separately, and the file's compression is printed with the results so
+compressed and uncompressed inputs are never mixed in one table:
+
+```bash
+python benchmarks/bench.py file.rds --reps 5
+python benchmarks/bench.py file.rds --reps 7 --ops catalog,pandas
+```
+
 ## Synthetic 15-table RDS
 
 Environment: Linux, Python 3.12, DuckDB 1.5.4, PyArrow 25.0.0. Input was an
