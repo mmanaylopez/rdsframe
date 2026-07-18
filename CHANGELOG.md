@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.4.0b2 - 2026-07-18
+
+- Fixed: a corrupt or truncated **compressed** RDS container (gzip/bzip2/xz/
+  zstd) leaked the decompressor's own exception -- `EOFError`,
+  `gzip.BadGzipFile`, `zlib.error`, `lzma.LZMAError`, a zstd error, or a bare
+  `OSError` -- past the documented "malformed input raises `RDSError`"
+  contract. Because R saves RDS gzip-compressed by *default*, this affected the
+  most common on-disk form (the uncompressed path already failed cleanly
+  through the parser's own length/EOF checks, so existing corrupt-input tests
+  never exercised the decompressor error surface). Decompression is now guarded
+  at a single choke point (`_DecompressionReadGuard`) so every such failure
+  surfaces as `InvalidRDS`. A parametrized regression test corrupts and
+  truncates every compression container and asserts only `RDSError` escapes.
+- Added deferred `open_rds()` / `RDSDataset`: cached structural `schema`,
+  `columns`, `shape`, table and column selection, `head()`/`collect()`, and
+  terminal pandas, Arrow, Polars, and DuckDB conversions. Single-root column
+  projections reuse the structural skip path; `head()` limits the result but
+  does not pretend RDS supports row-random access.
+- Added `inspect_rds(mode="metadata"|"scan")`. Metadata mode records storage
+  and logical types, factors/levels, rows, compression, and fixed-width memory
+  estimates without materializing columns. Scan mode explicitly adds exact
+  Arrow null counts, buffer bytes, and Arrow types.
+- Added `read_rds_polars()`, `read_rds_duckdb()`, `RDSDataset.to_polars()`,
+  `.to_duckdb()`, and `.register_duckdb()`, plus a `rdsframe[polars]` extra.
+  The DuckDB integration exposes an Arrow relation/view; a native SQL
+  `read_rds(path)` extension remains future work.
+- The catalog sidecar format is now version 2 (adds per-column schema:
+  storage/logical type, factor levels, and fixed-width estimates); version 1
+  sidecars still load.
+- Packaging: the Trove classifier is now `Development Status :: 4 - Beta`,
+  matching the beta version line.
+
 ## 0.4.0b1 - 2026-07-16
 
 ### Upgrade notes

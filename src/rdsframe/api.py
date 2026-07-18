@@ -10,7 +10,7 @@ import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, TypeAlias, cast
 
@@ -28,6 +28,7 @@ from ._core import (
     RAWSXP,
     REALSXP,
     S4SXP,
+    SEXP_TYPE_NAMES,
     STRSXP,
     VECSXP,
     ZSTD_MAGIC,
@@ -50,7 +51,15 @@ from ._core import (
     resolve_native_encoding,
     symbol_name,
 )
-from ._scan import ScannedVector, as_dataframe, scan_dataframe_from_header, scan_vector_from_header
+from ._scan import (
+    ScannedColumn,
+    ScannedFrame,
+    ScannedVector,
+    as_dataframe,
+    scan_column_from_header,
+    scan_dataframe_from_header,
+    scan_vector_from_header,
+)
 
 # Sources accepted by the in-memory read functions: a filesystem path, raw
 # RDS bytes, or an already-open seekable binary stream.
@@ -78,6 +87,23 @@ class ParquetTable:
 
 
 @dataclass(frozen=True, slots=True)
+class RDSColumnInfo:
+    """Structural type information for one R data.frame column."""
+
+    name: str
+    r_type: str
+    logical_type: str
+    length: int | None
+    factor: bool = False
+    ordered: bool = False
+    levels: tuple[str, ...] = ()
+    estimated_bytes: int | None = None
+    missing_count: int | None = None
+    data_bytes: int | None = None
+    arrow_type: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class RTableInfo:
     """Cheap structural metadata for one data.frame inside an RDS file."""
 
@@ -86,6 +112,17 @@ class RTableInfo:
     rows: int | None
     columns: int
     column_names: tuple[str, ...]
+    schema: tuple[RDSColumnInfo, ...] = ()
+
+    @property
+    def estimated_memory_bytes(self) -> int:
+        return sum(column.estimated_bytes or 0 for column in self.schema)
+
+    @property
+    def estimate_complete(self) -> bool:
+        return bool(self.schema) and all(
+            column.estimated_bytes is not None for column in self.schema
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,7 +150,7 @@ class RDSCatalog:
     def to_dict(self) -> dict[str, Any]:
         return {
             "format": "rdsframe.catalog",
-            "version": 1,
+            "version": 2,
             "source": {
                 "path": str(self.path),
                 "size_bytes": self.size_bytes,
@@ -127,6 +164,19 @@ class RDSCatalog:
                     "rows": table.rows,
                     "columns": table.columns,
                     "column_names": list(table.column_names),
+                    "schema": [
+                        {
+                            "name": column.name,
+                            "r_type": column.r_type,
+                            "logical_type": column.logical_type,
+                            "length": column.length,
+                            "factor": column.factor,
+                            "ordered": column.ordered,
+                            "levels": list(column.levels),
+                            "estimated_bytes": column.estimated_bytes,
+                        }
+                        for column in table.schema
+                    ],
                 }
                 for table in self.tables
             ],
@@ -155,7 +205,9 @@ class RDSCatalog:
         """Load a catalog; source-file freshness is checked when it is used."""
         try:
             payload = json.loads(Path(source).read_text(encoding="utf-8"))
-            if payload.get("format") != "rdsframe.catalog" or payload.get("version") != 1:
+            if payload.get("format") != "rdsframe.catalog" or payload.get(
+                "version"
+            ) not in {1, 2}:
                 raise ValueError("unsupported catalog format or version")
             metadata = payload["source"]
             tables = tuple(
@@ -165,6 +217,27 @@ class RDSCatalog:
                     None if item["rows"] is None else int(item["rows"]),
                     int(item["columns"]),
                     tuple(str(name) for name in item["column_names"]),
+                    tuple(
+                        RDSColumnInfo(
+                            name=str(column["name"]),
+                            r_type=str(column["r_type"]),
+                            logical_type=str(column["logical_type"]),
+                            length=(
+                                None
+                                if column.get("length") is None
+                                else int(column["length"])
+                            ),
+                            factor=bool(column.get("factor", False)),
+                            ordered=bool(column.get("ordered", False)),
+                            levels=tuple(str(level) for level in column.get("levels", [])),
+                            estimated_bytes=(
+                                None
+                                if column.get("estimated_bytes") is None
+                                else int(column["estimated_bytes"])
+                            ),
+                        )
+                        for column in item.get("schema", [])
+                    ),
                 )
                 for item in payload["tables"]
             )
@@ -175,8 +248,47 @@ class RDSCatalog:
                 str(metadata["compression"]),
                 tables,
             )
-        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        except (
+            AttributeError,
+            OSError,
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
             raise RDSCatalogError(f"invalid RDS catalog: {source}") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class RDSInspection:
+    """File, table, schema, and optional exact column statistics."""
+
+    file: RFileInfo
+    tables: tuple[RTableInfo, ...]
+    statistics_complete: bool = False
+
+    @property
+    def rows(self) -> int | None:
+        known = [table.rows for table in self.tables]
+        if any(value is None for value in known):
+            return None
+        return sum(cast("list[int]", known))
+
+    @property
+    def columns(self) -> int:
+        return sum(table.columns for table in self.tables)
+
+    @property
+    def compression(self) -> str:
+        return self.file.compression
+
+    @property
+    def estimated_memory_bytes(self) -> int:
+        return sum(table.estimated_memory_bytes for table in self.tables)
+
+    @property
+    def estimate_complete(self) -> bool:
+        return bool(self.tables) and all(table.estimate_complete for table in self.tables)
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,6 +399,7 @@ def list_rds_tables(
     cache: bool | os.PathLike[str] | str = False,
     progress: ProgressCallback | None = None,
     limits: ReaderLimits | None = None,
+    encoding: str | None = None,
 ) -> RDSCatalog:
     """List data.frames without allocating their vector payloads.
 
@@ -309,7 +422,9 @@ def list_rds_tables(
             # validate a user-supplied catalog rather than rebuild it.
             pass
         else:
-            if cached.matches(source):
+            if cached.matches(source) and all(
+                len(table.schema) == table.columns for table in cached.tables
+            ):
                 _emit_progress(progress, 0)
                 _emit_progress(progress, 100)
                 return cached
@@ -317,7 +432,7 @@ def list_rds_tables(
     file_info = inspect_r_file(source)
     _emit_progress(progress, 0)
     with open_rds_stream(source) as (stream, raw, _compression):
-        version, byteorder, _encoding = decode_header(stream)
+        version, byteorder, declared_encoding = decode_header(stream)
         if version not in {2, 3}:
             raise UnsupportedRDS(f"serialization version {version} is not supported")
         reader = Reader(
@@ -328,6 +443,8 @@ def list_rds_tables(
             total_bytes=stat.st_size,
             compressed_position=raw.tell,
             seekable_discard=stream is raw,
+            native_encoding=resolve_native_encoding(declared_encoding, encoding),
+            utf8_fallback=encoding,
         )
         root_header = reader.flags()
         if root_header[0] != VECSXP:
@@ -358,24 +475,30 @@ def list_rds_tables(
                 )
             names = as_strings(root_attributes.get("names"))
             table_info = tuple(
-                RTableInfo(
+                _table_info_from_scan(
                     index,
-                    names[index] if index < len(names) and names[index] else f"table_{index + 1}",
-                    frame.rows,
-                    frame.columns,
-                    frame.column_names,
+                    names[index]
+                    if index < len(names) and names[index]
+                    else f"table_{index + 1}",
+                    frame,
                 )
                 for index, frame in enumerate(frames)
             )
         else:
             first_length = first_scan.summary.length
+            column_scans = [
+                ScannedColumn(first_scan.summary, first_scan.attributes)
+            ]
             for _index in range(1, root_count):
-                reader.skip_item()
+                column_scans.append(
+                    scan_column_from_header(reader, reader.flags())
+                )
             root_attributes = reader.read_attributes() if root_header[2] else {}
             root_scan = ScannedVector(
                 summary=SkippedObject(VECSXP, root_count),
                 attributes=root_attributes,
                 first_element_length=first_length,
+                column_scans=tuple(column_scans),
             )
             frame = as_dataframe(root_scan)
             if frame is None:
@@ -383,9 +506,7 @@ def list_rds_tables(
                     "root VECSXP is not a data.frame; "
                     "use read_r_object() to read it as a general R value"
                 )
-            table_info = (
-                RTableInfo(0, "data", frame.rows, frame.columns, frame.column_names),
-            )
+            table_info = (_table_info_from_scan(0, "data", frame),)
     _emit_progress(progress, 100)
     catalog = RDSCatalog(
         source,
@@ -405,6 +526,78 @@ def list_rds_tables(
     return catalog
 
 
+_R_TYPE_NAMES = {
+    INTSXP: "integer",
+    LGLSXP: "logical",
+    REALSXP: "double",
+    STRSXP: "character",
+    CPLXSXP: "complex",
+    RAWSXP: "raw",
+    VECSXP: "list",
+}
+
+_R_FIXED_WIDTH = {
+    INTSXP: 4,
+    LGLSXP: 4,
+    REALSXP: 8,
+    CPLXSXP: 16,
+    RAWSXP: 1,
+}
+
+
+def _table_info_from_scan(index: int, name: str, frame: ScannedFrame) -> RTableInfo:
+    schema = tuple(
+        _column_info_from_scan(column_name, scan)
+        for column_name, scan in zip(
+            frame.column_names, frame.column_scans, strict=True
+        )
+    )
+    return RTableInfo(
+        index,
+        name,
+        frame.rows,
+        frame.columns,
+        frame.column_names,
+        schema,
+    )
+
+
+def _column_info_from_scan(name: str, scan: ScannedColumn) -> RDSColumnInfo:
+    sexp_type = scan.summary.sexp_type
+    classes = as_strings(scan.attributes.get("class"))
+    factor = "factor" in classes
+    if factor:
+        logical_type = "ordered_factor" if "ordered" in classes else "factor"
+    elif "Date" in classes:
+        logical_type = "date"
+    elif "POSIXct" in classes:
+        logical_type = "datetime"
+    elif "POSIXlt" in classes:
+        logical_type = "datetime_components"
+    elif "difftime" in classes:
+        logical_type = "duration"
+    elif scan.attributes.get("dim") is not None:
+        logical_type = "array"
+    else:
+        logical_type = _R_TYPE_NAMES.get(sexp_type, f"sexp_{sexp_type}")
+    length = scan.summary.length
+    width = _R_FIXED_WIDTH.get(sexp_type)
+    estimated = length * width if length is not None and width is not None else None
+    r_type = _R_TYPE_NAMES.get(
+        sexp_type, SEXP_TYPE_NAMES.get(sexp_type, f"sexp_{sexp_type}")
+    )
+    return RDSColumnInfo(
+        name=name,
+        r_type=r_type,
+        logical_type=logical_type,
+        length=length,
+        factor=factor,
+        ordered="ordered" in classes,
+        levels=tuple(as_strings(scan.attributes.get("levels"))) if factor else (),
+        estimated_bytes=estimated,
+    )
+
+
 def _catalog_cache_path(source: Path, cache: bool | os.PathLike[str] | str) -> Path | None:
     """Resolve the opt-in catalog sidecar without touching the filesystem."""
     if cache is False:
@@ -415,6 +608,72 @@ def _catalog_cache_path(source: Path, cache: bool | os.PathLike[str] | str) -> P
     if result == source:
         raise ValueError("catalog cache path must differ from the RDS source")
     return result
+
+
+def inspect_rds(
+    path: os.PathLike[str] | str,
+    *,
+    mode: Literal["metadata", "scan"] = "metadata",
+    cache: bool | os.PathLike[str] | str = True,
+    progress: ProgressCallback | None = None,
+    limits: ReaderLimits | None = None,
+    encoding: str | None = None,
+) -> RDSInspection:
+    """Inspect tables and schemas, optionally computing exact column statistics.
+
+    ``mode="metadata"`` performs the low-allocation structural catalog pass.
+    Fixed-width memory estimates are available without materializing columns;
+    text/list sizes and missing counts remain unknown. ``mode="scan"`` reads
+    Arrow columns to report exact null counts, Arrow types, and buffer bytes.
+    """
+    if mode not in {"metadata", "scan"}:
+        raise ValueError("mode must be 'metadata' or 'scan'")
+    source = _validate_source(path)
+    catalog = list_rds_tables(
+        source,
+        cache=False if encoding is not None else cache,
+        progress=progress if mode == "metadata" else None,
+        limits=limits,
+        encoding=encoding,
+    )
+    inspection = RDSInspection(inspect_r_file(source), catalog.tables)
+    if mode == "metadata":
+        return inspection
+    arrow_root = read_rds_arrow(
+        source,
+        progress=progress,
+        limits=limits,
+        encoding=encoding,
+    )
+    arrow_tables = list(arrow_root.values()) if isinstance(arrow_root, dict) else [arrow_root]
+    if len(arrow_tables) != len(catalog.tables):
+        raise InvalidRDS("Arrow table count does not match the structural catalog")
+    tables: list[RTableInfo] = []
+    for table_info, table in zip(catalog.tables, arrow_tables, strict=True):
+        if table.num_columns != table_info.columns:
+            raise InvalidRDS("Arrow schema does not match the structural catalog")
+        columns: list[RDSColumnInfo] = []
+        for index, field in enumerate(table.schema):
+            base = table_info.schema[index]
+            array = table.column(index)
+            columns.append(
+                replace(
+                    base,
+                    length=table.num_rows,
+                    estimated_bytes=int(array.nbytes),
+                    missing_count=int(array.null_count),
+                    data_bytes=int(array.nbytes),
+                    arrow_type=str(field.type),
+                )
+            )
+        tables.append(
+            replace(
+                table_info,
+                rows=int(table.num_rows),
+                schema=tuple(columns),
+            )
+        )
+    return RDSInspection(inspection.file, tuple(tables), statistics_complete=True)
 
 
 def read_rds(
@@ -539,6 +798,290 @@ def read_rds_arrow(
     )
     _emit_progress(progress, 100)
     return result
+
+
+class RDSDataset:
+    """Deferred handle over an RDS file and an optional table/column projection."""
+
+    __slots__ = (
+        "_columns",
+        "_encoding",
+        "_inspection",
+        "_invalid_timestamp",
+        "_limits",
+        "_list_column_mode",
+        "_posixct_mode",
+        "_table",
+        "source",
+    )
+
+    def __init__(
+        self,
+        path: os.PathLike[str] | str,
+        *,
+        table: int | str | None = None,
+        columns: Sequence[str] | None = None,
+        limits: ReaderLimits | None = None,
+        encoding: str | None = None,
+        posixct_mode: Literal["preserve", "utc_naive"] = "preserve",
+        invalid_timestamp: Literal["error", "null"] = "error",
+        list_column_mode: Literal["infer", "json", "string"] = "infer",
+    ) -> None:
+        self.source = _validate_source(path).resolve()
+        self._table = table
+        if isinstance(columns, (str, bytes)):
+            raise TypeError("columns must be a sequence of names")
+        self._columns = tuple(columns) if columns is not None else None
+        self._limits = limits
+        self._encoding = encoding
+        self._posixct_mode = posixct_mode
+        self._invalid_timestamp = invalid_timestamp
+        self._list_column_mode = list_column_mode
+        self._inspection: RDSInspection | None = None
+
+    @property
+    def inspection(self) -> RDSInspection:
+        if self._inspection is None:
+            self._inspection = inspect_rds(
+                self.source,
+                cache=True,
+                limits=self._limits,
+                encoding=self._encoding,
+            )
+        return self._inspection
+
+    @property
+    def tables(self) -> tuple[RTableInfo, ...]:
+        return self.inspection.tables
+
+    def _selected_table_info(self) -> RTableInfo:
+        tables = self.tables
+        if self._table is None:
+            if len(tables) != 1:
+                raise ValueError("RDS contains multiple tables; select one with .table()")
+            return tables[0]
+        if isinstance(self._table, bool):
+            raise TypeError("boolean table selectors are not valid indices")
+        if isinstance(self._table, int):
+            if self._table < 0 or self._table >= len(tables):
+                raise RDSCatalogError(f"table index out of range: {self._table}")
+            return tables[self._table]
+        matches = [table for table in tables if table.name == self._table]
+        if not matches:
+            raise RDSCatalogError(f"table name not found: {self._table!r}")
+        if len(matches) > 1:
+            raise RDSCatalogError(
+                f"table name is ambiguous: {self._table!r}; use an integer index"
+            )
+        return matches[0]
+
+    @property
+    def schema(self) -> tuple[RDSColumnInfo, ...]:
+        table = self._selected_table_info()
+        if self._columns is None:
+            return table.schema
+        by_name = {column.name: column for column in table.schema}
+        missing = [name for name in self._columns if name not in by_name]
+        if missing:
+            raise ValueError(f"column names not found: {missing}")
+        return tuple(by_name[name] for name in self._columns)
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        return tuple(column.name for column in self.schema)
+
+    @property
+    def shape(self) -> tuple[int | None, int]:
+        table = self._selected_table_info()
+        return table.rows, len(self.columns)
+
+    def table(self, selector: int | str) -> RDSDataset:
+        return self._clone(table=selector)
+
+    def select(self, columns: Sequence[str]) -> RDSDataset:
+        if isinstance(columns, (str, bytes)):
+            raise TypeError("columns must be a sequence of names")
+        requested = tuple(columns)
+        if not requested:
+            raise ValueError("columns cannot be empty")
+        if len(set(requested)) != len(requested):
+            raise ValueError("column selection cannot contain duplicates")
+        available = set(self._selected_table_info().column_names)
+        missing = [name for name in requested if name not in available]
+        if missing:
+            raise ValueError(f"column names not found: {missing}")
+        return self._clone(columns=requested)
+
+    def __getitem__(self, key: str | Sequence[str]) -> RDSDataset:
+        return self.select([key] if isinstance(key, str) else key)
+
+    def collect(
+        self, *, strings: Literal["object", "string", "pyarrow"] = "object"
+    ) -> pd.DataFrame:
+        table_info = self._selected_table_info()
+        if len(self.tables) == 1:
+            result = read_rds(
+                self.source,
+                strings=strings,
+                columns=self._columns,
+                limits=self._limits,
+                encoding=self._encoding,
+            )
+            if not isinstance(result, pd.DataFrame):  # pragma: no cover - defensive
+                raise InvalidRDS("single-table catalog produced multiple pandas tables")
+            return result
+        result = read_rds(
+            self.source,
+            strings=strings,
+            limits=self._limits,
+            encoding=self._encoding,
+        )
+        if not isinstance(result, dict):  # pragma: no cover - defensive
+            raise InvalidRDS("multi-table catalog produced one pandas table")
+        frame = list(result.values())[table_info.index]
+        return frame if self._columns is None else frame.loc[:, list(self._columns)]
+
+    def head(
+        self,
+        rows: int = 5,
+        *,
+        strings: Literal["object", "string", "pyarrow"] = "object",
+    ) -> pd.DataFrame:
+        if rows < 0:
+            raise ValueError("rows cannot be negative")
+        return self.collect(strings=strings).head(rows)
+
+    def to_arrow(self) -> Any:
+        table_info = self._selected_table_info()
+        result = read_rds_arrow(
+            self.source,
+            limits=self._limits,
+            posixct_mode=self._posixct_mode,
+            invalid_timestamp=self._invalid_timestamp,
+            list_column_mode=self._list_column_mode,
+            encoding=self._encoding,
+        )
+        table = (
+            list(result.values())[table_info.index]
+            if isinstance(result, dict)
+            else result
+        )
+        return table if self._columns is None else table.select(list(self._columns))
+
+    def to_polars(self, *, rechunk: bool = True) -> Any:
+        try:
+            pl = importlib.import_module("polars")
+        except ImportError as exc:
+            raise ImportError(
+                "Polars integration requires: pip install 'rdsframe[polars]'"
+            ) from exc
+        return pl.from_arrow(self.to_arrow(), rechunk=rechunk)
+
+    def to_duckdb(self, connection: Any | None = None) -> Any:
+        try:
+            import duckdb
+        except ImportError as exc:
+            raise ImportError(
+                "DuckDB integration requires: pip install 'rdsframe[duckdb]'"
+            ) from exc
+        table = self.to_arrow()
+        return duckdb.from_arrow(table) if connection is None else connection.from_arrow(table)
+
+    def register_duckdb(self, name: str, connection: Any | None = None) -> Any:
+        """Register the projected table and return its DuckDB connection."""
+        if not name:
+            raise ValueError("DuckDB registration name cannot be empty")
+        try:
+            import duckdb
+        except ImportError as exc:
+            raise ImportError(
+                "DuckDB integration requires: pip install 'rdsframe[duckdb]'"
+            ) from exc
+        target = duckdb.connect() if connection is None else connection
+        target.register(name, self.to_arrow())
+        return target
+
+    def _clone(
+        self,
+        *,
+        table: int | str | None = None,
+        columns: Sequence[str] | None = None,
+    ) -> RDSDataset:
+        result = RDSDataset(
+            self.source,
+            table=self._table if table is None else table,
+            columns=self._columns if columns is None else columns,
+            limits=self._limits,
+            encoding=self._encoding,
+            posixct_mode=self._posixct_mode,
+            invalid_timestamp=self._invalid_timestamp,
+            list_column_mode=self._list_column_mode,
+        )
+        result._inspection = self._inspection
+        return result
+
+    def __repr__(self) -> str:
+        projection = "*" if self._columns is None else ", ".join(self._columns)
+        table = "auto" if self._table is None else repr(self._table)
+        return f"RDSDataset({str(self.source)!r}, table={table}, columns=[{projection}])"
+
+
+def open_rds(
+    path: os.PathLike[str] | str,
+    *,
+    table: int | str | None = None,
+    columns: Sequence[str] | None = None,
+    limits: ReaderLimits | None = None,
+    encoding: str | None = None,
+    posixct_mode: Literal["preserve", "utc_naive"] = "preserve",
+    invalid_timestamp: Literal["error", "null"] = "error",
+    list_column_mode: Literal["infer", "json", "string"] = "infer",
+) -> RDSDataset:
+    """Open an RDS path as a deferred dataset without reading its payload yet."""
+    return RDSDataset(
+        path,
+        table=table,
+        columns=columns,
+        limits=limits,
+        encoding=encoding,
+        posixct_mode=posixct_mode,
+        invalid_timestamp=invalid_timestamp,
+        list_column_mode=list_column_mode,
+    )
+
+
+def read_rds_polars(path: RDSSource, **options: Any) -> Any:
+    """Read RDS data.frames into Polars through the public Arrow path."""
+    try:
+        pl = importlib.import_module("polars")
+    except ImportError as exc:
+        raise ImportError(
+            "Polars integration requires: pip install 'rdsframe[polars]'"
+        ) from exc
+    result = read_rds_arrow(path, **options)
+    if isinstance(result, dict):
+        return {name: pl.from_arrow(table) for name, table in result.items()}
+    return pl.from_arrow(result)
+
+
+def read_rds_duckdb(
+    path: os.PathLike[str] | str,
+    *,
+    table: int | str | None = None,
+    columns: Sequence[str] | None = None,
+    connection: Any | None = None,
+    limits: ReaderLimits | None = None,
+    encoding: str | None = None,
+) -> Any:
+    """Expose one RDS table as a DuckDB relation backed by an Arrow table."""
+    dataset = open_rds(
+        path,
+        table=table,
+        columns=columns,
+        limits=limits,
+        encoding=encoding,
+    )
+    return dataset.to_duckdb(connection)
 
 
 def _read_dataframe_selective(

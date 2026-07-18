@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rdsframe"
-version = "0.4.0b1"
+version = "0.4.0b2"
 description = "Fast, memory-conscious reader for RDS data.frames"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,7 @@ license = "MIT"
 authors = [{ name = "Miguel Antonio Manay López" }]
 keywords = ["rds", "rdata", "pandas", "dataframe", "r", "parquet"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
   "Intended Audience :: Science/Research",
   "Operating System :: OS Independent",
@@ -33,6 +33,7 @@ dependencies = [
 arrow = ["pyarrow>=12"]
 parquet = ["pyarrow>=12"]
 duckdb = ["duckdb>=1.0", "pyarrow>=12"]
+polars = ["polars>=1.0", "pyarrow>=12"]
 zstd = ["zstandard>=0.16"]
 dev = [
   "build>=1.2",

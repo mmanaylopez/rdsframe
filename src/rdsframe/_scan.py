@@ -18,12 +18,24 @@ from ._core import (
     as_value,
 )
 
+_FRAME_ATTRIBUTES = frozenset(
+    {"class", "dim", "levels", "names", "row.names", "tzone", "units"}
+)
+_COLUMN_ATTRIBUTES = frozenset({"class", "dim", "levels", "tzone", "units"})
+
 
 @dataclass(frozen=True, slots=True)
 class ScannedFrame:
     rows: int | None
     columns: int
     column_names: tuple[str, ...]
+    column_scans: tuple[ScannedColumn, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ScannedColumn:
+    summary: SkippedObject
+    attributes: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +43,7 @@ class ScannedVector:
     summary: SkippedObject
     attributes: dict[str, Any]
     first_element_length: int | None = None
+    column_scans: tuple[ScannedColumn, ...] = ()
 
 
 def scan_vector_from_header(
@@ -39,17 +52,36 @@ def scan_vector_from_header(
     """Skip a vector-like object but retain its small attribute pairlist."""
     sexp_type, _is_object, has_attr, _has_tag, _flags = header
     if sexp_type != VECSXP:
-        return ScannedVector(reader.skip_item_from_header(header), {})
+        column = scan_column_from_header(reader, header)
+        return ScannedVector(column.summary, column.attributes)
     length = reader.length()
     first_element_length: int | None = None
+    column_scans: list[ScannedColumn] = []
     for index in range(length):
-        item = reader.skip_item()
+        item = scan_column_from_header(reader, reader.flags())
+        column_scans.append(item)
         if index == 0:
-            first_element_length = item.length
-    attributes = reader.read_attributes() if has_attr else {}
+            first_element_length = item.summary.length
+    attributes = reader.read_selected_attributes(_FRAME_ATTRIBUTES) if has_attr else {}
     return ScannedVector(
-        SkippedObject(VECSXP, length), attributes, first_element_length
+        SkippedObject(VECSXP, length),
+        attributes,
+        first_element_length,
+        tuple(column_scans),
     )
+
+
+def scan_column_from_header(
+    reader: Reader, header: tuple[int, bool, bool, bool, int]
+) -> ScannedColumn:
+    """Skip one column payload while retaining its small attribute pairlist."""
+    sexp_type, is_object, has_attr, has_tag, flags = header
+    payload_header = (sexp_type, is_object, False, has_tag, flags)
+    summary = reader.skip_item_from_header(payload_header)
+    attributes = (
+        reader.read_selected_attributes(_COLUMN_ATTRIBUTES) if has_attr else {}
+    )
+    return ScannedColumn(summary, attributes)
 
 
 def as_dataframe(scan: ScannedVector) -> ScannedFrame | None:
@@ -64,7 +96,7 @@ def as_dataframe(scan: ScannedVector) -> ScannedFrame | None:
     rows = _rows_from_attributes(scan.attributes)
     if rows is None:
         rows = scan.first_element_length
-    return ScannedFrame(rows, columns, tuple(names))
+    return ScannedFrame(rows, columns, tuple(names), scan.column_scans)
 
 
 def scan_dataframe_from_header(

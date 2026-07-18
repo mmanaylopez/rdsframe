@@ -1186,6 +1186,28 @@ class Reader:
             raise InvalidRDS("attribute payload is not a pairlist")
         return self.read_pairlist(has_tag)
 
+    def read_selected_attributes(self, names: frozenset[str]) -> dict[str, Any]:
+        """Retain selected attributes while structurally skipping other values."""
+        sexp_type, _is_object, _has_attr, has_tag, _flags = self.flags()
+        if sexp_type in {NILSXP, NILVALUE_SXP}:
+            return {}
+        if sexp_type != LISTSXP:
+            raise InvalidRDS("attribute payload is not a pairlist")
+        result: dict[str, Any] = {}
+        current_has_tag = has_tag
+        while True:
+            tag = symbol_name(self.read_item()) if current_has_tag else None
+            if tag is not None and tag in names:
+                result[tag] = self.read_item()
+            else:
+                self.skip_item()
+            sexp_type, _is_object, _has_attr, next_has_tag, _flags = self.flags()
+            if sexp_type in {NILSXP, NILVALUE_SXP}:
+                return result
+            if sexp_type != LISTSXP:
+                raise UnsupportedRDS("pairlist tail is not a LISTSXP")
+            current_has_tag = next_has_tag
+
 
 # Bit pattern of R's NA_real_: an IEEE NaN whose low word is 1954. It must be
 # told apart from an ordinary NaN because as.character() renders NA as missing
@@ -1457,6 +1479,54 @@ def is_buffer_source(source: Any) -> bool:
     )
 
 
+class _DecompressionReadGuard(io.RawIOBase):
+    """Re-raise decompressor read failures as :class:`InvalidRDS`.
+
+    R writes RDS gzip-compressed by default (bzip2/xz/zstd are also common). A
+    truncated or corrupted container makes the decompressor raise its own
+    library-specific error -- ``EOFError``, ``gzip.BadGzipFile``,
+    ``zlib.error``, ``lzma.LZMAError``, a zstd error, a bare ``OSError`` --
+    *lazily*, deep inside the parse when the bytes are finally pulled. None of
+    those subclass :class:`RDSError`, so without translation they leak past the
+    documented "malformed input raises ``InvalidRDS``" contract precisely for
+    the most common on-disk form (the uncompressed path already fails cleanly
+    through the parser's own length/EOF checks). This raw wrapper sits between
+    the decompressor and the outer :class:`io.BufferedReader` so every
+    decompressed read is guarded at a single choke point without touching the
+    hot per-element read primitives.
+    """
+
+    def __init__(self, decompressor: Any) -> None:
+        super().__init__()
+        self._decompressor = decompressor
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        try:
+            readinto = getattr(self._decompressor, "readinto", None)
+            if readinto is not None:
+                count = readinto(buffer)
+                return 0 if count is None else count
+            chunk = self._decompressor.read(len(buffer))
+        except (RDSError, MemoryError):
+            # Our own contract errors and genuine resource exhaustion must not
+            # be masked as a decompression failure.
+            raise
+        except Exception as exc:
+            raise InvalidRDS("corrupt or truncated compressed RDS container") from exc
+        count = len(chunk)
+        buffer[:count] = chunk
+        return count
+
+    def close(self) -> None:
+        try:
+            self._decompressor.close()
+        finally:
+            super().close()
+
+
 @contextmanager
 def open_rds_stream(source: Any) -> Iterator[tuple[BinaryIO, BinaryIO, str]]:
     # The parser issues very many small reads (a flags/length pair per string
@@ -1495,7 +1565,9 @@ def open_rds_stream(source: Any) -> Iterator[tuple[BinaryIO, BinaryIO, str]]:
         else:
             decompressor, compression = None, "none"
         if decompressor is not None:
-            stream = io.BufferedReader(decompressor, buffer_size=_STREAM_BUFFER_SIZE)
+            stream = io.BufferedReader(
+                _DecompressionReadGuard(decompressor), buffer_size=_STREAM_BUFFER_SIZE
+            )
         yield stream, raw, compression
     finally:
         if stream is not raw:

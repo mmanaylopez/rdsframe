@@ -17,7 +17,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install -e ".[dev,duckdb,zstd]"
+      - run: python -m pip install -e ".[dev,duckdb,polars,zstd]"
       - run: python -c "import rdsframe; assert rdsframe.compiled_backend_available()"
       - run: pytest
       - run: pytest
@@ -31,7 +31,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install -e ".[dev,duckdb,zstd]"
+      - run: python -m pip install -e ".[dev,duckdb,polars,zstd]"
       - run: ruff check .
       - run: mypy src/rdsframe
       - run: pytest --cov=rdsframe --cov-report=term-missing --cov-fail-under=80

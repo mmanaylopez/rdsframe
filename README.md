@@ -10,7 +10,7 @@ files directly into pandas. Numeric vectors are filled in their final NumPy
 allocation, which avoids the large intermediate Python object tree created by
 general-purpose R serialization readers.
 
-> Status: 0.4.0b1 pre-release. Validate results against R for critical pipelines.
+> Status: 0.4.0b2 pre-release (beta). Validate results against R for critical pipelines.
 > Unsupported R structures fail explicitly; they are never silently coerced.
 
 ## Features
@@ -42,6 +42,8 @@ general-purpose R serialization readers.
 - Nullable pandas integer/boolean dtypes and categorical factors.
 - Public Arrow-table reads plus Parquet export through PyArrow or the optional
   memory-bounded DuckDB engine, and a command-line interface.
+- Deferred `open_rds()` datasets with structural schemas and column projection,
+  exact/metadata-only inspection modes, and Arrow-backed Polars/DuckDB adapters.
 - Configurable defensive limits for untrusted or unexpectedly large inputs.
 - Low-allocation table catalogs and selective extraction by index, name, or
   (for `read_rds()`) column, plus `materialize_uncompressed()` for repeated
@@ -98,6 +100,12 @@ batch rather than a complete table:
 pip install "rdsframe[duckdb]"
 ```
 
+For Polars:
+
+```bash
+pip install "rdsframe[polars]"
+```
+
 For zstd-compressed RDS on Python < 3.14:
 
 ```bash
@@ -136,6 +144,91 @@ table = read_rds_arrow("measurements.rds")
 ```
 
 A named list returns `dict[str, pyarrow.Table]`.
+
+### Deferred datasets and inspection
+
+`open_rds()` creates a lightweight handle. Accessing `schema` performs or
+reuses the structural catalog scan; payloads are not converted to NumPy,
+pandas, Arrow or Polars until a terminal operation is requested:
+
+```python
+from rdsframe import open_rds
+
+dataset = open_rds("measurements.rds")
+
+print(dataset.schema)
+print(dataset.columns)
+print(dataset.shape)
+
+preview = dataset[["peso", "edad"]].head(10)
+peso = dataset["peso"].collect()
+arrow = dataset.select(["peso", "edad"]).to_arrow()
+```
+
+For a named list of data.frames, choose one explicitly:
+
+```python
+stations = open_rds("workspace.rds").table("stations")
+```
+
+Projection is lazy and a single-root data.frame skips unselected columns.
+`head()` currently limits the returned pandas result, not the underlying RDS
+vector read: R serializes complete columns, so the selected columns are still
+consumed. Compressed input must also be decompressed sequentially to reach a
+later column.
+
+Metadata-only inspection never materializes column payloads:
+
+```python
+from rdsframe import inspect_rds
+
+info = inspect_rds("measurements.rds")
+print(info.rows, info.columns, info.compression)
+for column in info.tables[0].schema:
+    print(column.name, column.logical_type, column.factor, column.estimated_bytes)
+```
+
+Fixed-width columns have a structural memory estimate. Text/list memory and
+missing counts cannot be known without reading their elements; request the
+explicit scan when exact Arrow buffer sizes and null counts are needed:
+
+```python
+info = inspect_rds("measurements.rds", mode="scan")
+print(info.statistics_complete)
+print(info.tables[0].schema[0].missing_count)
+```
+
+### Polars and DuckDB
+
+Both adapters reuse the Arrow conversion and avoid pandas:
+
+```python
+from rdsframe import open_rds, read_rds_polars
+
+frame = read_rds_polars("measurements.rds")
+frame = open_rds("measurements.rds").select(["edad", "peso"]).to_polars()
+```
+
+DuckDB can consume the projected table as a relation or registered SQL view:
+
+```python
+dataset = open_rds("measurements.rds").select(["sexo", "edad", "peso"])
+
+relation = dataset.to_duckdb()
+result = relation.filter("edad >= 18").aggregate("sexo, avg(peso)")
+
+connection = dataset.register_duckdb("measurements")
+result = connection.sql("""
+    SELECT sexo, avg(peso)
+    FROM measurements
+    WHERE edad >= 18
+    GROUP BY sexo
+""")
+```
+
+This is a Python/Arrow registration, not yet a native DuckDB
+`read_rds('path')` table function; query projection should therefore be applied
+on the `RDSDataset` before registration.
 
 To read only a few fields from a wide single data.frame, select columns by
 zero-based index or exact name. Unselected columns are structurally skipped:
@@ -354,7 +447,7 @@ GROUP BY category;
 ## Development
 
 ```bash
-python -m pip install -e ".[dev,duckdb,zstd]"
+python -m pip install -e ".[dev,duckdb,polars,zstd]"
 pytest
 ruff check .
 mypy src/rdsframe

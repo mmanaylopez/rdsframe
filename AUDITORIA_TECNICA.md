@@ -482,3 +482,32 @@ La capa posterior ya está abierta: `read_rds_arrow()` es pública;
 selección de tablas por nombre crea/reutiliza automáticamente el catálogo. La
 CI ejecuta mypy estricto, cobertura mínima del 80%, el fallback sin Cython,
 NumPy 1.23.5/pandas 1.5.3 y los casos corruptos/fuzz.
+
+## API analítica diferida rumbo a 1.0 (2026-07-18)
+
+`open_rds()` expone ahora un `RDSDataset` diferido. El constructor solo valida
+la ruta; `schema`, `columns`, `shape` y `tables` usan el catálogo estructural
+versionado, que conserva tipo de almacenamiento R, tipo lógico, factores,
+niveles y estimaciones para vectores de ancho fijo. `select()` y `table()`
+componen una proyección; `collect()`, `to_arrow()`, `to_polars()` o
+`to_duckdb()` son operaciones terminales. Para un único data.frame raíz,
+`collect()` reutiliza `columns=` y las columnas no seleccionadas se omiten
+estructuralmente.
+
+`inspect_rds(mode="metadata")` no construye payloads de columna y devuelve
+filas, columnas, compresión, schema, factores y estimaciones disponibles. No
+inventa estadísticas imposibles: el tamaño real del texto/listas y los missing
+requieren leer elementos. `mode="scan"` hace esa lectura de forma explícita y
+añade conteo exacto de nulos, bytes de buffers y tipo Arrow.
+
+La integración Polars (`read_rds_polars()` / `.to_polars()`) reutiliza Arrow y
+no pasa por pandas. DuckDB puede recibir la proyección como relación o como una
+vista registrada con `register_duckdb()`, permitiendo SQL normal sobre el
+nombre elegido. Esto no se presenta como una función nativa
+`read_rds('archivo')`: esa sintaxis requiere una extensión DuckDB y pushdown
+del optimizador, y permanece como trabajo posterior sin bloquear la API 1.0.
+
+La semántica lazy también se documenta sin exagerarla: `head(n)` limita el
+resultado devuelto, pero todavía consume los vectores RDS seleccionados
+completos. RDS es columnar-secuencial y un contenedor comprimido debe
+descomprimir los bytes anteriores para alcanzar columnas tardías.
