@@ -232,6 +232,10 @@ def validate_rds(
         tables = catalog.tables
         for table in tables:
             issues.extend(_column_issues(table))
+        # The catalog pass stops at the end of the root object without
+        # checking what follows; the trailing-bytes probe needs its own
+        # structural traversal.
+        issues.extend(_skip_root_and_probe(source, limits, encoding))
     return RDSValidationReport(source, file_info, tables, tuple(issues))
 
 
@@ -259,19 +263,16 @@ def _fallback_file_info(source: Path) -> RFileInfo:
     )
 
 
-def _validate_non_tabular(
+def _skip_root_and_probe(
     source: Path,
-    original: UnsupportedRDS,
     limits: ReaderLimits | None,
     encoding: str | None,
 ) -> list[RDSValidationIssue]:
-    """Integrity-check a file whose root is not a data.frame.
+    """Structurally skip the whole root object and probe for trailing bytes.
 
-    The catalog pass stopped at a structural mismatch, which is not the same
-    thing as a broken file: a plain list or vector is valid RDS that simply
-    needs ``read_r_object()``. A full structural skip settles which case
-    this is -- it traverses every byte with bounded memory, so truncation,
-    bad lengths, and genuinely unsupported R types are still detected.
+    Traverses every byte with bounded memory, so truncation, bad lengths,
+    and genuinely unsupported R types surface as issues. An empty result
+    means the stream is exactly one clean object.
     """
     issues: list[RDSValidationIssue] = []
     try:
@@ -318,10 +319,24 @@ def _validate_non_tabular(
         issues.append(RDSValidationIssue("error", "invalid", str(exc)))
     except RDSLimitError as exc:
         issues.append(RDSValidationIssue("error", "limit", str(exc)))
-    else:
-        issues.append(
-            RDSValidationIssue("info", "non-tabular", str(original))
-        )
+    return issues
+
+
+def _validate_non_tabular(
+    source: Path,
+    original: UnsupportedRDS,
+    limits: ReaderLimits | None,
+    encoding: str | None,
+) -> list[RDSValidationIssue]:
+    """Integrity-check a file whose root is not a data.frame.
+
+    The catalog pass stopped at a structural mismatch, which is not the same
+    thing as a broken file: a plain list or vector is valid RDS that simply
+    needs ``read_r_object()``.
+    """
+    issues = _skip_root_and_probe(source, limits, encoding)
+    if not any(issue.severity == "error" for issue in issues):
+        issues.append(RDSValidationIssue("info", "non-tabular", str(original)))
     return issues
 
 
@@ -423,7 +438,7 @@ def diff_rds(
             entries.append(RDSDiffEntry("table_added", table=name))
 
     common = [name for name in left_tables if name in right_tables]
-    comparable_columns: dict[str, list[str]] = {}
+    comparable_columns: dict[str, list[tuple[str, int, int]]] = {}
     for name in common:
         table_entries, comparable = _diff_table(
             left_tables[name], right_tables[name]
@@ -461,10 +476,38 @@ def _preview(values: list[str], limit: int = 5) -> str:
     return shown
 
 
+def _keyed_columns(
+    table: RTableInfo,
+) -> list[tuple[tuple[str, int], int, Any]]:
+    """Schema columns keyed by ``(name, occurrence)`` in serialized order.
+
+    R tolerates duplicate column names, so a plain name-keyed dict would
+    silently collapse duplicates -- an audit tool must keep each occurrence
+    distinct and compare positionally.
+    """
+    counts: dict[str, int] = {}
+    keyed: list[tuple[tuple[str, int], int, Any]] = []
+    for position, column in enumerate(table.schema):
+        occurrence = counts.get(column.name, 0)
+        counts[column.name] = occurrence + 1
+        keyed.append(((column.name, occurrence), position, column))
+    return keyed
+
+
+def _display_name(key: tuple[str, int]) -> str:
+    name, occurrence = key
+    return name if occurrence == 0 else f"{name} (occurrence {occurrence + 1})"
+
+
 def _diff_table(
     left: RTableInfo, right: RTableInfo
-) -> tuple[list[RDSDiffEntry], list[str]]:
-    """Structural entries for one table plus its value-comparable columns."""
+) -> tuple[list[RDSDiffEntry], list[tuple[str, int, int]]]:
+    """Structural entries for one table plus its value-comparable columns.
+
+    The comparable list carries ``(display_name, left_position,
+    right_position)`` so the content tier can address columns positionally
+    -- including duplicated names, which Arrow cannot look up by name.
+    """
     entries: list[RDSDiffEntry] = []
     if left.rows is not None and right.rows is not None and left.rows != right.rows:
         entries.append(
@@ -475,44 +518,47 @@ def _diff_table(
                 after=str(right.rows),
             )
         )
-    left_columns = {column.name: column for column in left.schema}
-    right_columns = {column.name: column for column in right.schema}
-    for name in left_columns:
-        if name not in right_columns:
+    left_keyed = _keyed_columns(left)
+    right_keyed = _keyed_columns(right)
+    left_map = {key: (position, column) for key, position, column in left_keyed}
+    right_map = {key: (position, column) for key, position, column in right_keyed}
+    for key, _position, column in left_keyed:
+        if key not in right_map:
             entries.append(
                 RDSDiffEntry(
                     "column_removed",
                     table=left.name,
-                    column=name,
-                    before=_describe_column(left_columns[name]),
+                    column=_display_name(key),
+                    before=_describe_column(column),
                 )
             )
-    for name in right_columns:
-        if name not in left_columns:
+    for key, _position, column in right_keyed:
+        if key not in left_map:
             entries.append(
                 RDSDiffEntry(
                     "column_added",
                     table=left.name,
-                    column=name,
-                    after=_describe_column(right_columns[name]),
+                    column=_display_name(key),
+                    after=_describe_column(column),
                 )
             )
-    common_left_order = [c.name for c in left.schema if c.name in right_columns]
-    common_right_order = [c.name for c in right.schema if c.name in left_columns]
+    common_left_order = [key for key, _p, _c in left_keyed if key in right_map]
+    common_right_order = [key for key, _p, _c in right_keyed if key in left_map]
     if common_left_order != common_right_order:
         entries.append(
             RDSDiffEntry(
                 "columns_reordered",
                 table=left.name,
-                before=", ".join(common_left_order),
-                after=", ".join(common_right_order),
+                before=", ".join(_display_name(key) for key in common_left_order),
+                after=", ".join(_display_name(key) for key in common_right_order),
             )
         )
 
-    comparable: list[str] = []
-    for name in common_left_order:
-        before_column = left_columns[name]
-        after_column = right_columns[name]
+    comparable: list[tuple[str, int, int]] = []
+    for key in common_left_order:
+        name = _display_name(key)
+        left_position, before_column = left_map[key]
+        right_position, after_column = right_map[key]
         if (
             before_column.r_type != after_column.r_type
             or before_column.logical_type != after_column.logical_type
@@ -559,7 +605,7 @@ def _diff_table(
             )
             # Levels changed but codes may still decode to equal values;
             # the column stays comparable at the value level.
-        comparable.append(name)
+        comparable.append((name, left_position, right_position))
     return entries, comparable
 
 
@@ -568,7 +614,7 @@ def _diff_content(
     right_source: Path,
     left_tables: tuple[RTableInfo, ...],
     right_tables: tuple[RTableInfo, ...],
-    comparable_columns: dict[str, list[str]],
+    comparable_columns: dict[str, list[tuple[str, int, int]]],
     *,
     limits: ReaderLimits | None,
     encoding: str | None,
@@ -604,13 +650,11 @@ def _diff_content(
         right_table = right_arrow.get(table_name)
         if left_table is None or right_table is None:  # pragma: no cover - defensive
             continue
-        for column_name in columns:
+        for column_name, left_position, right_position in columns:
             try:
-                left_column = left_table.column(column_name)
-                right_column = right_table.column(column_name)
-            except KeyError:
-                # Duplicate column labels make name lookup ambiguous in
-                # Arrow; the structural tier already covered such columns.
+                left_column = left_table.column(left_position)
+                right_column = right_table.column(right_position)
+            except (KeyError, IndexError):  # pragma: no cover - defensive
                 continue
             if len(left_column) != len(right_column):
                 continue  # rows_changed is already reported structurally

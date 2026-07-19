@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- Added `open_rds_dataset()`: many RDS files (glob, directory, or explicit
+  paths) as one validated collection, with strict/union schema modes,
+  column projection, filename partitions, a source column, per-file
+  parallel catalog scans and Parquet export, and `to_arrow()` /
+  `to_pandas()` / `to_polars()` / `to_record_batch_reader()` terminals.
+  Type compatibility is validated from structural catalogs before any
+  payload is read; factor columns whose level sets differ across files
+  decode to plain strings, never a silent promotion.
+- `write_rds()` hardening after external review: `int64="double"` now
+  rejects integers beyond 2**53 instead of silently rounding them (opt in
+  with the new `int64="lossy_double"`); naive datetime columns require an
+  explicit `naive_timezone=` (R displays tzone-less POSIXct in the reading
+  session's own zone, so the writer refuses to guess); factor categories
+  are stringified the way R's `as.character()` would (TRUE/FALSE, %.15g)
+  and collisions such as `1` vs `"1"` are rejected instead of writing a
+  factor R can produce but rdsframe cannot re-read; duplicate or missing
+  row labels are rejected (R requires unique row.names); an unsupported
+  list-valued cell now fails as `RDSWriteError` naming the column rather
+  than an ambiguous `ValueError` from `pd.isna()`.
+- `diff_rds()` now compares columns positionally by `(name, occurrence)`,
+  so files differing only in duplicated-name columns are no longer
+  declared identical, and duplicate-named columns participate in the
+  `content=True` tier (they were previously skipped as ambiguous).
+- `validate_rds()` now probes for trailing bytes after tabular roots too;
+  a valid data.frame followed by junk was previously reported clean.
+- Dataset fixes from the same review: a named list holding a single
+  data.frame no longer breaks the selective read path; mixed POSIXct time
+  zones across files raise instead of silently concatenating to
+  `dtype=object`, and `posixct_mode="utc_naive"` now applies to the pandas
+  path; `columns=` projection is applied before cross-file type validation
+  so unselected incompatible columns cannot block it; memory promises in
+  the API docs now say "one complete file", which is what materializes.
+- Packaging: `main` now identifies as `0.4.0b3.dev0` so a Git install is
+  distinguishable from the published `0.4.0b2`; the sdist includes
+  `.RData`/`.rda` test fixtures; `.gitattributes` covers the remaining
+  R-serialization filename casings.
+
 - Added `read_rdata()`: reads `.RData`/`.rda` workspaces (R's `save()`
   output) as a name-to-value dict, converting each object exactly like
   `read_r_object()` (data.frames -> pandas DataFrames, named lists ->

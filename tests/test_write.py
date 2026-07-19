@@ -96,14 +96,31 @@ def test_datetime_roundtrip(tmp_path: Path) -> None:
     )
     aware = naive.tz_localize("UTC").tz_convert("America/Lima")
     frame = pd.DataFrame({"t": naive, "tz": aware})
-    result = _roundtrip(frame, tmp_path)
-    assert result["t"][0] == pd.Timestamp("2020-06-01 12:30:00.5")
-    assert pd.isna(result["t"][1])
-    assert result["t"][2] == pd.Timestamp("1969-12-31 23:59:59")
+    result = _roundtrip(frame, tmp_path, naive_timezone="UTC")
+    written = pd.DatetimeIndex(result["t"])
+    assert str(written.tz) == "UTC"  # the declared zone travels with the file
+    assert written[0] == pd.Timestamp("2020-06-01 12:30:00.5", tz="UTC")
+    assert pd.isna(written[1])
+    assert written[2] == pd.Timestamp("1969-12-31 23:59:59", tz="UTC")
     zoned = pd.DatetimeIndex(result["tz"])
     assert str(zoned.tz) == "America/Lima"
     assert zoned[0] == aware[0]
     assert pd.isna(zoned[1])
+
+
+def test_naive_datetime_requires_timezone_policy(tmp_path: Path) -> None:
+    """R displays tzone-less POSIXct in the reader's own timezone, so a
+    naive column written blindly shows a different wall time there."""
+    frame = pd.DataFrame({"t": pd.to_datetime(["2020-06-01 12:30:00"])})
+    with pytest.raises(RDSWriteError, match="naive_timezone"):
+        write_rds(frame, tmp_path / "naive.rds")
+    with pytest.raises(ValueError, match="IANA zone"):
+        write_rds(frame, tmp_path / "naive.rds", naive_timezone="Marte/Olympus")
+    result = _roundtrip(frame, tmp_path, naive_timezone="America/Lima")
+    written = pd.DatetimeIndex(result["t"])
+    assert str(written.tz) == "America/Lima"
+    # The wall-clock reading is preserved under the declared zone.
+    assert written[0].tz_localize(None) == pd.Timestamp("2020-06-01 12:30:00")
 
 
 def test_timedelta_roundtrip(tmp_path: Path) -> None:
@@ -151,6 +168,65 @@ def test_int64_policy(tmp_path: Path) -> None:
     sentinel = pd.DataFrame({"x": np.array([-(2**31)], dtype=np.int64)})
     with pytest.raises(RDSWriteError, match="NA"):
         write_rds(sentinel, tmp_path / "sentinel.rds")
+
+
+def test_int64_double_rejects_precision_loss(tmp_path: Path) -> None:
+    """2**53 + 1 rounds to 2**53 as float64; 'double' must refuse, and the
+    check must run on the original integers (the converted value hides it)."""
+    exact_edge = pd.DataFrame({"x": [2**53, -(2**53)]})
+    result = _roundtrip(exact_edge, tmp_path, int64="double")
+    assert result["x"].tolist() == [float(2**53), float(-(2**53))]
+
+    beyond = pd.DataFrame({"x": [2**53 + 1]})
+    with pytest.raises(RDSWriteError, match="2\\*\\*53"):
+        write_rds(beyond, tmp_path / "beyond.rds", int64="double")
+    lossy = _roundtrip(beyond, tmp_path, int64="lossy_double")
+    assert lossy["x"].tolist() == [float(2**53)]  # the documented rounding
+
+    unsigned = pd.DataFrame({"x": np.array([2**63 + 8], dtype=np.uint64)})
+    with pytest.raises(RDSWriteError, match="lossy_double"):
+        write_rds(unsigned, tmp_path / "unsigned.rds", int64="double")
+    lossy_unsigned = _roundtrip(unsigned, tmp_path, int64="lossy_double")
+    assert lossy_unsigned["x"].tolist() == [float(2**63)]
+
+
+def test_factor_levels_match_r_and_reject_collisions(tmp_path: Path) -> None:
+    booleans = pd.DataFrame({"f": pd.Categorical([True, False, True])})
+    result = _roundtrip(booleans, tmp_path)
+    # R's as.character() renders TRUE/FALSE, not Python's True/False.
+    assert sorted(result["f"].cat.categories) == ["FALSE", "TRUE"]
+
+    colliding = pd.DataFrame({"f": pd.Categorical.from_codes([0, 1], [1, "1"])})
+    with pytest.raises(RDSWriteError, match="collide"):
+        write_rds(colliding, tmp_path / "collide.rds")
+
+    unsupported = pd.DataFrame(
+        {"f": pd.Categorical.from_codes([0], [(1, 2)])}
+    )
+    with pytest.raises(RDSWriteError, match="unsupported type"):
+        write_rds(unsupported, tmp_path / "tuple.rds")
+
+
+def test_row_names_must_be_unique_and_present(tmp_path: Path) -> None:
+    duplicated = pd.DataFrame({"x": [1, 2]}, index=["a", "a"])
+    with pytest.raises(RDSWriteError, match="duplicates"):
+        write_rds(duplicated, tmp_path / "dup.rds")
+
+    missing = pd.DataFrame({"x": [1.0, 2.0]}, index=pd.Index([0.5, float("nan")]))
+    with pytest.raises(RDSWriteError, match="missing"):
+        write_rds(missing, tmp_path / "nan.rds")
+
+    colliding = pd.DataFrame({"x": [1, 2]}, index=pd.Index([1, "1"], dtype=object))
+    with pytest.raises(RDSWriteError, match="collide"):
+        write_rds(colliding, tmp_path / "collide.rds")
+
+
+def test_unsupported_list_column_fails_as_write_error(tmp_path: Path) -> None:
+    """A cell holding a list used to escape as an ambiguous ValueError from
+    pd.isna(); it must surface as RDSWriteError naming the column."""
+    frame = pd.DataFrame({"lst": [[1, 2], [3]]})
+    with pytest.raises(RDSWriteError, match="'lst'"):
+        write_rds(frame, tmp_path / "lst.rds")
 
 
 @pytest.mark.parametrize("compress", ["gzip", "bzip2", "xz", "none"])

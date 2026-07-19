@@ -4,5 +4,7 @@
 # checkout with core.autocrlf=true corrupts it by rewriting LF to CRLF.
 *.rds binary
 *.RData binary
+*.rdata binary
 *.rda binary
+*.RDA binary
 *.pyd binary

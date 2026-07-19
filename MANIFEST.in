@@ -6,7 +6,7 @@ include README.md
 include pyproject.toml
 include setup.py
 recursive-include src/rdsframe *.c *.py *.pyi *.pyx py.typed
-recursive-include tests *.py *.R *.rds
+recursive-include tests *.py *.R *.rds *.rda *.RData *.rdata *.RDA
 global-exclude *.py[cod] *.pyd __pycache__
 prune build
 prune dist

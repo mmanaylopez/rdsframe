@@ -53,6 +53,39 @@ def test_validate_trailing_data(tmp_path: Path) -> None:
     assert any(issue.code == "trailing-data" for issue in report.warnings)
 
 
+def test_validate_trailing_data_after_tabular_root(tmp_path: Path) -> None:
+    """A valid data.frame followed by junk used to validate clean: the
+    catalog pass stops at the root object without probing what follows."""
+    target = tmp_path / "trailing_df.rds"
+    target.write_bytes(rds(dataframe([integers([1, 2])], ["x"])) + b"junk")
+    report = validate_rds(target)
+    assert any(issue.code == "trailing-data" for issue in report.warnings)
+
+
+def test_diff_distinguishes_duplicate_column_names(tmp_path: Path) -> None:
+    """R tolerates duplicate column names; a name-keyed diff silently
+    collapsed them and declared structurally different files identical."""
+    from conftest import reals
+
+    left = tmp_path / "left.rds"
+    right = tmp_path / "right.rds"
+    left.write_bytes(
+        rds(dataframe([integers([1, 2]), reals([1.0, 2.0])], ["x", "x"]))
+    )
+    right.write_bytes(
+        rds(dataframe([reals([1.0, 2.0]), reals([1.0, 2.0])], ["x", "x"]))
+    )
+    report = diff_rds(left, right)
+    assert not report.identical
+    assert any(
+        entry.kind == "type_changed" and entry.column == "x"
+        for entry in report.entries
+    )
+    # Occurrences beyond the first are labeled so entries stay unambiguous.
+    same = diff_rds(left, left)
+    assert same.identical
+
+
 def test_validate_list_column_warning(tmp_path: Path) -> None:
     payload = dataframe(
         [integers([1, 2]), vectors([integers([1]), strings(["x"])])],

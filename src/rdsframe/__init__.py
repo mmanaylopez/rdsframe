@@ -16,6 +16,7 @@ from ._core import (
     ReaderLimits,
     UnsupportedRDS,
 )
+from ._dataset import RDSCollection, open_rds_dataset
 from ._write import RDSWriteError, write_rds
 from .api import (
     ParquetTable,
@@ -48,6 +49,7 @@ __all__ = [
     "ParquetTable",
     "RDSCatalog",
     "RDSCatalogError",
+    "RDSCollection",
     "RDSColumnInfo",
     "RDSDataset",
     "RDSDiffEntry",
@@ -71,6 +73,7 @@ __all__ = [
     "list_rds_tables",
     "materialize_uncompressed",
     "open_rds",
+    "open_rds_dataset",
     "read_r_object",
     "read_rdata",
     "read_rds",
@@ -83,4 +86,4 @@ __all__ = [
     "write_rds",
 ]
 
-__version__ = "0.4.0b2"
+__version__ = "0.4.0b3.dev0"

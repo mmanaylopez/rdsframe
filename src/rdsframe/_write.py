@@ -85,7 +85,11 @@ _UNITS_PER_DAY = {
 }
 
 Compression = Literal["gzip", "bzip2", "xz", "zstd", "none"]
-Int64Policy = Literal["error", "double"]
+Int64Policy = Literal["error", "double", "lossy_double"]
+
+# float64 represents every integer with |value| <= 2**53 exactly; beyond it,
+# distinct integers can collapse to the same double.
+_FLOAT64_EXACT_LIMIT = 2**53
 
 
 class RDSWriteError(RDSError):
@@ -230,8 +234,30 @@ def _encode_integerish(
             f"column {column!r} has integer values outside R's 32-bit range "
             f"[{_INT32_MIN_VALID}, {_INT32_MAX}] (note: -2**31 is R's NA "
             "sentinel); pass int64='double' to write them as R doubles "
-            "(exact up to 2**53)"
+            "(exact up to 2**53) or int64='lossy_double' to accept rounding "
+            "beyond that"
         )
+    if int64 == "double":
+        # The exactness check must run on the original integers: converting
+        # first would round 2**53 + 1 down to exactly 2**53 and hide itself.
+        if values is None:
+            raise RDSWriteError(
+                f"column {column!r} has integers beyond the int64 range, "
+                "which float64 cannot represent exactly; pass "
+                "int64='lossy_double' to accept the rounding"
+            )
+        checkable = values[~mask] if mask.any() else values
+        if bool(
+            (
+                (checkable < -_FLOAT64_EXACT_LIMIT)
+                | (checkable > _FLOAT64_EXACT_LIMIT)
+            ).any()
+        ):
+            raise RDSWriteError(
+                f"column {column!r} has integers beyond 2**53 whose float64 "
+                "form would silently lose precision; pass "
+                "int64='lossy_double' to accept the rounding"
+            )
     doubles = series.to_numpy(dtype="float64", na_value=np.nan)
     return (
         _flags(REALSXP)
@@ -241,7 +267,12 @@ def _encode_integerish(
 
 
 def _encode_column(
-    label: str, series: pd.Series, *, int64: Int64Policy, as_date: bool
+    label: str,
+    series: pd.Series,
+    *,
+    int64: Int64Policy,
+    as_date: bool,
+    naive_timezone: str | None,
 ) -> bytes:
     dtype = series.dtype
 
@@ -261,7 +292,26 @@ def _encode_column(
     if pd.api.types.is_datetime64_any_dtype(dtype):
         if as_date:
             return _encode_date(label, series)
-        return _encode_posixct(label, series, series.isna(), None)
+        # A POSIXct without a tzone attribute displays in whatever timezone
+        # the *reading* R session happens to use, so a naive column written
+        # blindly shows a different wall time there. Writing requires the
+        # caller to say which zone the naive values mean.
+        if naive_timezone is None:
+            raise RDSWriteError(
+                f"column {label!r} is a naive datetime; R would display it "
+                "in the reading session's timezone. Pass "
+                "naive_timezone='UTC' to keep the wall time as written, or "
+                "the IANA zone the values belong to"
+            )
+        try:
+            localized = series.dt.tz_localize(naive_timezone)
+        except Exception as exc:
+            raise RDSWriteError(
+                f"column {label!r} cannot be localized to "
+                f"{naive_timezone!r}: {exc}"
+            ) from exc
+        naive_utc = localized.dt.tz_convert("UTC").dt.tz_localize(None)
+        return _encode_posixct(label, naive_utc, series.isna(), naive_timezone)
 
     if as_date:
         raise RDSWriteError(
@@ -318,12 +368,22 @@ def _encode_column(
     )
 
 
+def _scalar_is_missing(value: Any) -> bool:
+    """pd.isna() for one cell; containers (arrays/lists) are not missing."""
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
 def _encode_object_column(label: str, series: pd.Series) -> bytes:
     """Object columns: all-strings become STRSXP; all-dates become R Date."""
     values = list(series)
-    kinds = {type(v) for v in values if v is not None and not pd.isna(v)}
+    kinds = {type(v) for v in values if not _scalar_is_missing(v)}
     if kinds <= {str}:
-        items = [None if v is None or pd.isna(v) else str(v) for v in values]
+        items = [None if _scalar_is_missing(v) else str(v) for v in values]
         return _strsxp(items, label)
     if kinds == {_dt.date}:
         # datetime.datetime is a date subclass; the exact-type check above
@@ -332,7 +392,7 @@ def _encode_object_column(label: str, series: pd.Series) -> bytes:
         days = np.zeros(len(values), dtype=np.float64)
         mask = np.zeros(len(values), dtype=bool)
         for index, value in enumerate(values):
-            if value is None or pd.isna(value):
+            if _scalar_is_missing(value):
                 mask[index] = True
             else:
                 days[index] = float((value - epoch).days)
@@ -349,11 +409,43 @@ def _encode_object_column(label: str, series: pd.Series) -> bytes:
     )
 
 
+def _level_string(value: Any, column: str) -> str:
+    """Stringify one category the way R's as.character() would.
+
+    str() alone is wrong for R: Python renders True/False where R renders
+    TRUE/FALSE, and long floats print differently. Unsupported category
+    types fail explicitly instead of producing levels R never would.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bool, np.bool_)):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        return f"{float(value):.15g}"
+    if isinstance(value, (_dt.date, _dt.datetime, pd.Timestamp)):
+        return str(value)
+    raise RDSWriteError(
+        f"column {column!r} has a factor level of unsupported type "
+        f"{type(value).__name__}; convert the categories to strings first"
+    )
+
+
 def _encode_factor(label: str, series: pd.Series) -> bytes:
     categories = series.cat.categories
-    # Mirror R's factor(): non-string level values are stringified exactly
-    # as as.character() would produce them for the common cases.
-    levels = [str(category) for category in categories]
+    levels = [_level_string(category, label) for category in categories]
+    # Distinct pandas categories (1 vs "1", True vs "TRUE") can collide once
+    # stringified; R factor levels must be unique or the file is unreadable.
+    counts: dict[str, int] = {}
+    for level in levels:
+        counts[level] = counts.get(level, 0) + 1
+    collisions = sorted(level for level, count in counts.items() if count > 1)
+    if collisions:
+        raise RDSWriteError(
+            f"column {label!r}: distinct pandas categories collide as R "
+            f"levels {collisions}; make the categories unique strings first"
+        )
     codes = series.cat.codes.to_numpy(dtype="int64") + 1  # R codes are 1-based
     mask = codes == 0
     payload = (
@@ -439,6 +531,18 @@ def _row_names(frame: pd.DataFrame) -> bytes:
             "MultiIndex row labels cannot be represented as R row.names; "
             "reset_index() first"
         )
+    # R requires row.names to be unique and non-missing; writing anything
+    # else produces a data.frame that misbehaves or self-repairs in R.
+    if index.hasnans:
+        raise RDSWriteError(
+            "row labels contain missing values, which R row.names cannot "
+            "represent; reset_index() first"
+        )
+    if index.has_duplicates:
+        raise RDSWriteError(
+            "row labels contain duplicates, but R requires unique "
+            "row.names; reset_index() first"
+        )
     if isinstance(index, pd.RangeIndex) and index.start == 0 and index.step == 1:
         if len(index) == 0:
             return _flags(INTSXP) + _i32(0)  # R stores integer(0) here
@@ -455,7 +559,12 @@ def _row_names(frame: pd.DataFrame) -> bytes:
                 + _i32(_length_checked(len(values), "row.names"))
                 + _int32_be(values, mask)
             )
-    labels = [None if pd.isna(value) else str(value) for value in index]
+    labels: list[str | None] = [str(value) for value in index]
+    if len(set(labels)) != len(labels):
+        raise RDSWriteError(
+            "row labels collide after string conversion (e.g. 1 vs '1'); R "
+            "requires unique row.names -- reset_index() first"
+        )
     return _strsxp(labels, "row.names")
 
 
@@ -465,6 +574,7 @@ def _write_frame(
     *,
     int64: Int64Policy,
     date_columns: frozenset[str],
+    naive_timezone: str | None,
 ) -> None:
     labels = [str(column) for column in frame.columns]
     out.write(_flags(VECSXP, is_object=True, has_attr=True) + _i32(len(labels)))
@@ -477,6 +587,7 @@ def _write_frame(
                 frame.iloc[:, position],
                 int64=int64,
                 as_date=label in date_columns,
+                naive_timezone=naive_timezone,
             )
         )
     out.write(
@@ -496,18 +607,31 @@ def _write_stream(
     *,
     int64: Int64Policy,
     date_columns: frozenset[str],
+    naive_timezone: str | None,
 ) -> None:
     # XDR RDS header, serialization version 3 (R >= 3.5.0 reads it), with
     # the native-encoding field every modern R writes.
     out.write(b"X\n" + struct.pack(">iii", 3, 0x040500, 0x030500))
     out.write(_i32(5) + b"UTF-8")
     if isinstance(data, pd.DataFrame):
-        _write_frame(out, data, int64=int64, date_columns=date_columns)
+        _write_frame(
+            out,
+            data,
+            int64=int64,
+            date_columns=date_columns,
+            naive_timezone=naive_timezone,
+        )
         return
     names = list(data)
     out.write(_flags(VECSXP, has_attr=True) + _i32(len(names)))
     for name in names:
-        _write_frame(out, data[name], int64=int64, date_columns=date_columns)
+        _write_frame(
+            out,
+            data[name],
+            int64=int64,
+            date_columns=date_columns,
+            naive_timezone=naive_timezone,
+        )
     out.write(
         _attributes([("names", _strsxp(list(names), "names"))])
     )
@@ -567,6 +691,7 @@ def write_rds(
     compress: Compression = "gzip",
     int64: Int64Policy = "error",
     date_columns: Sequence[str] = (),
+    naive_timezone: str | None = None,
 ) -> Path | None:
     """Write a DataFrame (or a named mapping of them) as an RDS file.
 
@@ -579,19 +704,37 @@ def write_rds(
 
     ``int64`` controls integer columns with values outside R's 32-bit
     range: ``"error"`` (default) fails explicitly, ``"double"`` writes the
-    column as R doubles (exact up to 2**53).
+    column as R doubles but rejects values beyond 2**53 (where float64
+    starts losing exactness), and ``"lossy_double"`` accepts that rounding
+    explicitly.
 
     ``date_columns`` names naive datetime64 columns to write as R ``Date``
     (calendar days) instead of ``POSIXct``; non-midnight values in those
     columns are an error, never a silent truncation.
+
+    ``naive_timezone`` is required whenever a naive datetime64 column is
+    written as POSIXct: R displays a POSIXct without ``tzone`` in the
+    reading session's own timezone, so the writer refuses to guess. Pass
+    ``"UTC"`` to keep the wall time exactly as written, or the IANA zone
+    the naive values belong to.
     """
     _validate_data(data)
     if compress not in {"gzip", "bzip2", "xz", "zstd", "none"}:
         raise ValueError(
             "compress must be 'gzip', 'bzip2', 'xz', 'zstd', or 'none'"
         )
-    if int64 not in {"error", "double"}:
-        raise ValueError("int64 must be 'error' or 'double'")
+    if int64 not in {"error", "double", "lossy_double"}:
+        raise ValueError("int64 must be 'error', 'double', or 'lossy_double'")
+    if naive_timezone is not None:
+        import zoneinfo
+
+        try:
+            zoneinfo.ZoneInfo(naive_timezone)
+        except (zoneinfo.ZoneInfoNotFoundError, ValueError, TypeError) as exc:
+            raise ValueError(
+                f"naive_timezone must be an IANA zone name, got "
+                f"{naive_timezone!r}"
+            ) from exc
     if isinstance(date_columns, (str, bytes)):
         raise TypeError("date_columns must be a sequence of column names")
     forced_dates = frozenset(str(name) for name in date_columns)
@@ -605,7 +748,11 @@ def write_rds(
         stream = _open_compressor(path, compress)
         try:
             _write_stream(
-                stream, data, int64=int64, date_columns=forced_dates
+                stream,
+                data,
+                int64=int64,
+                date_columns=forced_dates,
+                naive_timezone=naive_timezone,
             )
         finally:
             if stream is not path:
@@ -623,7 +770,11 @@ def write_rds(
             stream = _open_compressor(raw, compress)
             try:
                 _write_stream(
-                    stream, data, int64=int64, date_columns=forced_dates
+                    stream,
+                    data,
+                    int64=int64,
+                    date_columns=forced_dates,
+                    naive_timezone=naive_timezone,
                 )
             finally:
                 if stream is not raw:
