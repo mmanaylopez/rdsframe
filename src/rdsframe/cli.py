@@ -16,7 +16,14 @@ import pandas as pd
 from . import __version__
 from ._audit import RDSDiffReport, RDSValidationReport, diff_rds, validate_rds
 from ._core import RDSError
-from .api import RDSCatalog, inspect_r_file, list_rds_tables, read_r_object, to_parquet
+from .api import (
+    RDSCatalog,
+    inspect_r_file,
+    list_rds_tables,
+    read_r_object,
+    read_rdata,
+    to_parquet,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -78,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dump_parser = subparsers.add_parser(
         "dump",
-        help="print any R object (not only data.frames) as a readable tree or JSON",
+        help="print any RDS object or RData workspace as a readable tree or JSON",
     )
     dump_parser.add_argument("input", type=Path)
     dump_parser.add_argument(
@@ -177,7 +184,12 @@ def _run(argv: list[str] | None = None) -> int:
             raise ValueError("--max-items must be at least 1")
         if args.max_depth < 1:
             raise ValueError("--max-depth must be at least 1")
-        value = read_r_object(args.input, encoding=args.encoding)
+        # RData workspaces route to their dedicated reader so `rdsframe dump
+        # workspace.RData` works without the user knowing the container type.
+        if inspect_r_file(args.input).container == "rdata":
+            value: Any = read_rdata(args.input, encoding=args.encoding)
+        else:
+            value = read_r_object(args.input, encoding=args.encoding)
         if args.as_json:
             print(json.dumps(_dump_json_ready(value), ensure_ascii=False, indent=2))
         else:

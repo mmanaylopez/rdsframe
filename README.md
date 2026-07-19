@@ -58,10 +58,14 @@ general-purpose R serialization readers.
   optional value-level comparison of two files (CLI: `rdsframe validate`,
   `rdsframe diff`).
 
-RData workspaces, ASCII serialization, closures/language objects, and custom
-third-party ALTREP classes are intentionally unsupported -- and fail with an
-error that names the R type, so applications can tell users exactly why a
-slower general-purpose fallback is being used.
+- `read_rdata()` for `.RData`/`.rda` workspaces: each saved object converts
+  like `read_r_object()`, and `select=` loads only the named objects while
+  structurally skipping the rest.
+
+ASCII serialization, closures/language objects, and custom third-party
+ALTREP classes are intentionally unsupported -- and fail with an error that
+names the R type, so applications can tell users exactly why a slower
+general-purpose fallback is being used.
 
 ## How it compares
 
@@ -562,13 +566,38 @@ The project lives at <https://github.com/mmanaylopez/rdsframe>.
    even though the accelerator is missing, and that wheel would shadow the
    sdist for every user of that platform.
 
-## RData and fallback integration
+## Reading RData workspaces
 
-`rdsframe` deliberately rejects `.RData`/`.rda` workspaces. Applications that
-need both formats should inspect the container and use `rdsframe` for supported
-binary RDS files, retaining `rdata` or another general reader as fallback for
-RData, unsupported ALTREP classes, and richer R objects. An
-`UnsupportedRDS` exception is the explicit signal to activate that fallback.
+`.RData`/`.rda` files (what R's `save()` produces) hold *named collections*
+of objects rather than one value. `read_rdata()` reads them as a dict:
+
+```python
+from rdsframe import read_rdata
+
+workspace = read_rdata("analysis.RData")
+workspace["results_df"]        # a pandas DataFrame
+workspace["model_params"]      # a dict / list / scalar, like read_r_object()
+
+# Load only what you need: everything else is structurally skipped and
+# never allocated (bytes are still traversed, and still decompressed in
+# a compressed workspace -- the saving is memory first, time second).
+subset = read_rdata("analysis.RData", select=["results_df"])
+```
+
+Values convert exactly like `read_r_object()`: data.frames become
+DataFrames, named lists become dicts, atomic vectors become
+scalars/lists with the usual NA, factor, and date/time handling. XDR and
+native-binary workspaces in serialization versions 2 and 3 are supported
+(that covers `save()` from any modern R); ASCII workspaces
+(`save(..., ascii = TRUE)`) fail explicitly. `rdsframe dump` on the CLI
+detects the container automatically, so it works on both RDS and RData.
+
+## Fallback integration
+
+Applications that need R objects beyond this library's scope (closures,
+language objects, custom third-party ALTREP classes) should retain a
+general reader as fallback; an `UnsupportedRDS` exception naming the R
+type is the explicit signal to activate it.
 
 ## Conversion policies
 

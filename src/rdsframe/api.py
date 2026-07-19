@@ -24,7 +24,10 @@ from ._core import (
     ENVSXP,
     INTSXP,
     LGLSXP,
+    LISTSXP,
     NA_INTEGER,
+    NILSXP,
+    NILVALUE_SXP,
     RAWSXP,
     REALSXP,
     S4SXP,
@@ -395,7 +398,7 @@ def inspect_r_file(path: os.PathLike[str] | str) -> RFileInfo:
         compression,  # type: ignore[arg-type]
         container,  # type: ignore[arg-type]
         serialization,  # type: ignore[arg-type]
-        container == "rds" and serialization in {"xdr", "native"},
+        container in {"rds", "rdata"} and serialization in {"xdr", "native"},
     )
 
 
@@ -1298,6 +1301,130 @@ def read_r_object(
         )
         root = reader.read_item()
     result = _serialized_to_python(root, strings=strings)
+    _emit_progress(progress, 100)
+    return result
+
+
+# save() writes a 5-byte container magic before the ordinary serialization
+# stream: RD + format letter (X=xdr, B=native binary, A=ascii) + version.
+_RDATA_SUPPORTED_MAGIC = {b"RDX2\n", b"RDX3\n", b"RDB2\n", b"RDB3\n"}
+_RDATA_ASCII_MAGIC = {b"RDA2\n", b"RDA3\n"}
+
+# Marks a workspace entry that was structurally skipped by ``select=`` while
+# preserving its position for name bookkeeping.
+_RDATA_SKIPPED = object()
+
+
+def read_rdata(
+    path: RDSSource,
+    *,
+    select: Sequence[str] | None = None,
+    progress: ProgressCallback | None = None,
+    limits: ReaderLimits | None = None,
+    strings: Literal["object", "string", "pyarrow"] = "object",
+    encoding: str | None = None,
+) -> dict[str, Any]:
+    """Read an RData workspace (``save()`` output) as a name-to-value dict.
+
+    An ``.RData``/``.rda`` file is the same serialization stream as an RDS
+    with a small container magic in front and a *named pairlist* of saved
+    objects as its root. Each value converts exactly like
+    :func:`read_r_object`: data.frames become pandas DataFrames, named lists
+    become dicts, atomic vectors become scalars/lists with the usual NA,
+    factor, and date/time handling.
+
+    ``select`` restricts materialization to the named objects; everything
+    else is structurally skipped (never allocated as NumPy/pandas values),
+    which preserves the stream's reference table so later objects that share
+    symbols or environments with skipped ones still resolve correctly. The
+    skipped bytes are still traversed -- and still decompressed for a
+    compressed workspace -- so the saving is memory first, time second.
+    Unknown names raise ``ValueError`` listing what the file contains.
+
+    ASCII-saved workspaces (``save(..., ascii = TRUE)``) are not supported.
+    ``path`` may also be raw bytes or a seekable binary stream.
+    """
+    source, total_bytes = _coerce_read_source(path)
+    if strings not in {"object", "string", "pyarrow"}:
+        raise ValueError("strings must be 'object', 'string', or 'pyarrow'")
+    if isinstance(select, (str, bytes)):
+        raise TypeError("select must be a sequence of object names")
+    wanted = None if select is None else {str(name) for name in select}
+    if wanted is not None and not wanted:
+        raise ValueError("select cannot be empty")
+
+    _emit_progress(progress, 0)
+    with open_rds_stream(source) as (stream, raw, _compression):
+        magic = stream.read(5)
+        if magic in _RDATA_ASCII_MAGIC:
+            raise UnsupportedRDS(
+                "ASCII RData workspaces are not supported; rewrite with "
+                "save(..., ascii = FALSE)"
+            )
+        if magic not in _RDATA_SUPPORTED_MAGIC:
+            if magic[:2] in {b"X\n", b"B\n", b"A\n"} or magic[:1] in {b"X", b"B"}:
+                raise UnsupportedRDS(
+                    "this is an RDS stream, not an RData workspace; use "
+                    "read_rds() or read_r_object()"
+                )
+            raise InvalidRDS(
+                f"not a supported RData workspace (magic={magic!r})"
+            )
+        version, byteorder, declared_encoding = decode_header(stream)
+        if version not in {2, 3}:
+            raise UnsupportedRDS(f"serialization version {version} is not supported")
+        reader = Reader(
+            stream,
+            byteorder=byteorder,
+            limits=limits or ReaderLimits(),
+            progress=progress,
+            total_bytes=total_bytes,
+            compressed_position=raw.tell,
+            arrow_strings=strings == "pyarrow",
+            seekable_discard=stream is raw,
+            native_encoding=resolve_native_encoding(declared_encoding, encoding),
+            utf8_fallback=encoding,
+        )
+        raw_objects: dict[str, Any] = {}
+        header = reader.flags()
+        if header[0] not in {NILSXP, NILVALUE_SXP}:
+            if header[0] != LISTSXP:
+                raise InvalidRDS("RData root is not a named pairlist")
+            has_tag = header[3]
+            while True:
+                if not has_tag:
+                    raise InvalidRDS("RData workspace entry has no name")
+                name = symbol_name(reader.read_item())
+                if not name:
+                    raise InvalidRDS("RData workspace entry has no name")
+                key = _unique_name(name, raw_objects)
+                if wanted is None or name in wanted:
+                    raw_objects[key] = reader.read_item()
+                else:
+                    # Structural skip registers the exact same reference-
+                    # table entries a full read would (symbols, environments,
+                    # S4), so later selected objects resolve shared
+                    # references correctly.
+                    reader.skip_item()
+                    raw_objects[key] = _RDATA_SKIPPED
+                sexp_type, _is_object, _has_attr, has_tag, _flags = reader.flags()
+                if sexp_type in {NILSXP, NILVALUE_SXP}:
+                    break
+                if sexp_type != LISTSXP:
+                    raise InvalidRDS("malformed RData pairlist")
+    if wanted is not None:
+        missing = sorted(wanted - set(raw_objects))
+        if missing:
+            available = ", ".join(sorted(raw_objects)) or "none"
+            raise ValueError(
+                f"objects not found in the RData workspace: {missing}; "
+                f"available: {available}"
+            )
+    result = {
+        key: _serialized_to_python(value, strings=strings)
+        for key, value in raw_objects.items()
+        if value is not _RDATA_SKIPPED
+    }
     _emit_progress(progress, 100)
     return result
 

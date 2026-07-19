@@ -101,6 +101,29 @@ save(quote(a + b), "language_call")
 # --- formula (LANGSXP with class) ---
 save(y ~ x + 1, "formula_object")
 
+# --- RData workspaces for read_rdata() (base::save; local save() is shadowed) ---
+df1 <- data.frame(
+  id = 1:4,
+  value = c(1.5, NA, 3.25, -2),
+  label = c("a", "b", NA, "día"),
+  stringsAsFactors = FALSE
+)
+df2 <- data.frame(
+  code = factor(c("x", "y", "x"), levels = c("x", "y", "z")),
+  flag = c(TRUE, NA, FALSE)
+)
+measurements <- c(first = 1.5, second = 2.5)
+title <- "workspace title"
+config <- list(alpha = 1L, beta = c("m", "n"))
+base::save(df1, df2, file = file.path(out, "workspace_two_frames.RData"))
+base::save(df1, measurements, title, config,
+           file = file.path(out, "workspace_mixed.RData"))
+base::save(df1, df2, file = file.path(out, "workspace_v2.RData"), version = 2)
+base::save(df1, file = file.path(out, "workspace_xz.RData"), compress = "xz")
+base::save(df1, file = file.path(out, "workspace_plain.RData"), compress = FALSE)
+base::save(df1, file = file.path(out, "workspace_ascii.RData"), ascii = TRUE)
+base::save(list = character(0), file = file.path(out, "workspace_empty.RData"))
+
 cat("fixtures2 written\n")
 print(list.files(out))
 

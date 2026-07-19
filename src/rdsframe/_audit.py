@@ -193,8 +193,8 @@ def validate_rds(
             RDSValidationIssue(
                 "error",
                 "rdata-container",
-                "RData workspaces are not supported; save the object with "
-                "saveRDS() instead",
+                "this is an RData workspace, not an RDS file; read it with "
+                "read_rdata()",
             )
         )
     elif file_info.serialization == "ascii":

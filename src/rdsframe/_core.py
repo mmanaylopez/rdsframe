@@ -1360,7 +1360,10 @@ def decode_header(stream: BinaryIO) -> tuple[int, str, str | None]:
     magic = stream.read(2)
     if magic.startswith(b"RD"):
         rest = stream.read(3)
-        raise UnsupportedRDS(f"RData container is not supported ({(magic + rest)!r})")
+        raise UnsupportedRDS(
+            f"this is an RData workspace ({(magic + rest)!r}), not an RDS "
+            "stream; read it with read_rdata()"
+        )
     if magic in {b"A\n", b"A\r"}:
         raise UnsupportedRDS("ASCII R serialization is not supported")
     if magic == b"B\n":
