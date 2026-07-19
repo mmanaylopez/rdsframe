@@ -1,5 +1,13 @@
 """Fast, memory-conscious RDS data.frame reader for Python."""
 
+from ._audit import (
+    RDSDiffEntry,
+    RDSDiffReport,
+    RDSValidationIssue,
+    RDSValidationReport,
+    diff_rds,
+    validate_rds,
+)
 from ._core import (
     InvalidRDS,
     RDSCatalogError,
@@ -41,9 +49,13 @@ __all__ = [
     "RDSCatalogError",
     "RDSColumnInfo",
     "RDSDataset",
+    "RDSDiffEntry",
+    "RDSDiffReport",
     "RDSError",
     "RDSInspection",
     "RDSLimitError",
+    "RDSValidationIssue",
+    "RDSValidationReport",
     "RDSWriteError",
     "RFileInfo",
     "RTableInfo",
@@ -51,6 +63,7 @@ __all__ = [
     "UnsupportedRDS",
     "compiled_backend_available",
     "convert_rds",
+    "diff_rds",
     "extract_rds_tables",
     "inspect_r_file",
     "inspect_rds",
@@ -64,6 +77,7 @@ __all__ = [
     "read_rds_duckdb",
     "read_rds_polars",
     "to_parquet",
+    "validate_rds",
     "write_rds",
 ]
 

@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from . import __version__
+from ._audit import RDSDiffReport, RDSValidationReport, diff_rds, validate_rds
 from ._core import RDSError
 from .api import RDSCatalog, inspect_r_file, list_rds_tables, read_r_object, to_parquet
 
@@ -98,6 +99,30 @@ def build_parser() -> argparse.ArgumentParser:
     dump_parser.add_argument(
         "--encoding", help="codec for unflagged native-encoding strings"
     )
+    validate_parser = subparsers.add_parser(
+        "validate",
+        help="check whether the file is readable and flag policy-sensitive columns",
+    )
+    validate_parser.add_argument("input", type=Path)
+    validate_parser.add_argument("--json", action="store_true", dest="as_json")
+    validate_parser.add_argument(
+        "--encoding", help="codec for unflagged native-encoding strings"
+    )
+    diff_parser = subparsers.add_parser(
+        "diff",
+        help="compare two RDS files (exit 0 identical, 1 different, 2 error)",
+    )
+    diff_parser.add_argument("left", type=Path)
+    diff_parser.add_argument("right", type=Path)
+    diff_parser.add_argument(
+        "--content",
+        action="store_true",
+        help="also read both files as Arrow and count differing rows per column",
+    )
+    diff_parser.add_argument("--json", action="store_true", dest="as_json")
+    diff_parser.add_argument(
+        "--encoding", help="codec for unflagged native-encoding strings"
+    )
     return parser
 
 
@@ -131,6 +156,22 @@ def _run(argv: list[str] | None = None) -> int:
                     f"{rows}\t{listed_table.columns}"
                 )
         return 0
+    if args.command == "validate":
+        report = validate_rds(args.input, encoding=args.encoding)
+        if args.as_json:
+            print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+        else:
+            _print_validation(report)
+        return 0 if report.ok else 1
+    if args.command == "diff":
+        diff = diff_rds(
+            args.left, args.right, content=args.content, encoding=args.encoding
+        )
+        if args.as_json:
+            print(json.dumps(diff.to_dict(), ensure_ascii=False, indent=2))
+        else:
+            _print_diff(diff)
+        return 0 if diff.identical else 1
     if args.command == "dump":
         if args.max_items < 1:
             raise ValueError("--max-items must be at least 1")
@@ -174,6 +215,47 @@ def _run(argv: list[str] | None = None) -> int:
             f"{output_table.columns} columns"
         )
     return 0
+
+
+def _print_validation(report: RDSValidationReport) -> None:
+    verdict = "OK" if report.ok else "NOT READABLE"
+    columns = sum(table.columns for table in report.tables)
+    summary = (
+        f"{len(report.tables)} tables, {columns} columns"
+        if report.tables
+        else "non-tabular or unreadable"
+    )
+    print(
+        f"{report.path.name}: {verdict} ({summary}, "
+        f"compression={report.file.compression})"
+    )
+    for issue in report.issues:
+        location = ""
+        if issue.table is not None:
+            location = f" {issue.table}"
+            if issue.column is not None:
+                location += f".{issue.column}"
+        print(f"  [{issue.severity}]{location} {issue.code}: {issue.message}")
+
+
+def _print_diff(report: RDSDiffReport) -> None:
+    tier = "content" if report.content_checked else "structure"
+    if report.identical:
+        print(f"identical ({tier})")
+        return
+    for entry in report.entries:
+        location = entry.table or ""
+        if entry.column is not None:
+            location = f"{location}.{entry.column}" if location else entry.column
+        pieces = [f"[{entry.kind}]"]
+        if location:
+            pieces.append(location)
+        if entry.before is not None or entry.after is not None:
+            pieces.append(f"{entry.before or '?'} -> {entry.after or '?'}")
+        if entry.detail:
+            pieces.append(f"({entry.detail})")
+        print(" ".join(pieces))
+    print(f"different: {len(report.entries)} change(s) at the {tier} level")
 
 
 def _summarize(value: Any) -> str:

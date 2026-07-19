@@ -53,6 +53,10 @@ general-purpose R serialization readers.
 - `write_rds()`: a limited, R-verified writer for flat data.frames (see
   "Writing RDS" below) with exact NA sentinels, explicit int64 policy, and
   deterministic output.
+- `validate_rds()` and `diff_rds()` for audit workflows: bounded-memory
+  integrity validation with stable issue codes, plus structural and
+  optional value-level comparison of two files (CLI: `rdsframe validate`,
+  `rdsframe diff`).
 
 RData workspaces, ASCII serialization, closures/language objects, and custom
 third-party ALTREP classes are intentionally unsupported -- and fail with an
@@ -298,6 +302,41 @@ CI verifies the claim with a real R: the writer's round-trip test has R
 `readRDS()` the written file, assert types, factor levels, NA positions and
 encodings with `stopifnot()`, `saveRDS()` it back, and requires
 `read_rds()` to see both files as identical.
+
+## Validating and diffing RDS files
+
+For regulated pipelines and R-to-Python migrations, `validate_rds()` and
+`diff_rds()` (also `rdsframe validate` / `rdsframe diff` on the command
+line) answer two audit questions without hand-written scripts:
+
+```python
+from rdsframe import diff_rds, validate_rds
+
+report = validate_rds("delivery.rds")
+report.ok            # can rdsframe read the whole file?
+report.issues        # stable codes: "invalid", "list-column", "non-tabular", ...
+
+changes = diff_rds("previous.rds", "current.rds")            # structural
+changes = diff_rds("previous.rds", "current.rds", content=True)  # + values
+changes.identical
+for entry in changes.entries:
+    print(entry.kind, entry.table, entry.column, entry.detail)
+```
+
+`validate_rds()` is structural: it traverses the entire stream with bounded
+memory (so truncation, corruption, and limit violations are detected) but
+materializes no column data. Warnings flag columns that need an explicit
+conversion policy (list columns); info entries note representation details
+(POSIXlt, complex) and non-tabular roots that need `read_r_object()`.
+
+`diff_rds()`'s structural tier compares catalogs only: tables added and
+removed, row counts, column sets and order, storage/logical types, and
+factor levels. `content=True` additionally reads both files as Arrow and
+counts differing rows per column (`"17 of 120 rows differ"`). Two equality
+rules are deliberate: comparison is positional (RDS preserves row order, so
+reordering is a difference), and float NaN equals NaN (R's `NA_real_` reads
+back as NaN; a value both files miss has not changed). The CLI exits 0 when
+identical, 1 when different, 2 on errors -- scriptable like GNU diff.
 
 ## Reading non-tabular RDS files
 

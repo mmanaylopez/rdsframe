@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Added `validate_rds()` and `diff_rds()` plus the `rdsframe validate` and
+  `rdsframe diff` CLI subcommands. Validation traverses the whole stream
+  with bounded memory -- truncation, corruption, limit violations, and
+  unsupported R types surface as issues with stable codes -- while
+  materializing no column payloads; list columns, POSIXlt, complex, and
+  non-tabular roots get policy/representation notes, and trailing bytes
+  after the root object are flagged. The diff's structural tier compares
+  catalogs only (tables, rows, column sets/order, storage and logical
+  types, factor levels, compression); `content=True` additionally reads
+  both files as Arrow and counts differing rows per column, comparing
+  positionally with NaN==NaN (R's `NA_real_` surfaces as NaN). CLI exit
+  codes are scriptable: 0 identical/ok, 1 different/not readable, 2 error.
 - Added `write_rds()`: a deliberately limited writer that turns a flat
   `pandas.DataFrame` (or a named mapping of them) into an RDS file R >= 3.5
   reads with plain `readRDS()`. Supported column types: integer, float,
