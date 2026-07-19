@@ -8,6 +8,7 @@ from ._core import (
     ReaderLimits,
     UnsupportedRDS,
 )
+from ._write import RDSWriteError, write_rds
 from .api import (
     ParquetTable,
     RDSCatalog,
@@ -43,6 +44,7 @@ __all__ = [
     "RDSError",
     "RDSInspection",
     "RDSLimitError",
+    "RDSWriteError",
     "RFileInfo",
     "RTableInfo",
     "ReaderLimits",
@@ -62,6 +64,7 @@ __all__ = [
     "read_rds_duckdb",
     "read_rds_polars",
     "to_parquet",
+    "write_rds",
 ]
 
 __version__ = "0.4.0b2"

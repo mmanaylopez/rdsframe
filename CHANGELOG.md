@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Added `write_rds()`: a deliberately limited writer that turns a flat
+  `pandas.DataFrame` (or a named mapping of them) into an RDS file R >= 3.5
+  reads with plain `readRDS()`. Supported column types: integer, float,
+  boolean, string, categorical (-> factor, ordered preserved), naive and
+  tz-aware datetime64 (-> POSIXct), timedelta64 (-> difftime in seconds),
+  `datetime.date` object columns (-> Date), and complex; anything else
+  raises the new `RDSWriteError` naming the column. Fidelity guarantees:
+  R's exact NA sentinels including the `NA_real_` bit pattern (`is.na()`
+  TRUE, `is.nan()` FALSE in R), UTF-8 strings with encoding flags, explicit
+  `int64="error"|"double"` policy for values outside R's 32-bit integers
+  (with `-2**31` rejected as R's NA sentinel), `date_columns=` for
+  midnight-only Date columns (non-midnight is an error, not a truncation),
+  index -> row.names round-trip, gzip/bzip2/xz/zstd/none containers,
+  atomic writes, and deterministic output (zeroed gzip mtime). A new CI job
+  installs real R and runs the round-trip test: R `readRDS()`s the written
+  file, validates types/levels/NAs/encoding with `stopifnot()`,
+  `saveRDS()`s it back, and `read_rds()` must see both files as identical.
 - Release engineering (external review follow-up): removed the stale
   `publish.yml` workflow -- it raced `release.yml` on every `v*` tag and had
   failed its Trusted Publishing OIDC exchange on every release since
