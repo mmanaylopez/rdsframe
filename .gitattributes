@@ -1,0 +1,8 @@
+# R serialization fixtures must never go through line-ending conversion:
+# an ASCII-mode RData (save(ascii = TRUE) implies compress = FALSE) contains
+# no NUL bytes, so git's heuristic classifies it as text and a Windows
+# checkout with core.autocrlf=true corrupts it by rewriting LF to CRLF.
+*.rds binary
+*.RData binary
+*.rda binary
+*.pyd binary
